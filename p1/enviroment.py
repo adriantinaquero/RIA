@@ -17,7 +17,7 @@ Es necesario calibrar BLOB_TAM_SATURACION, TAM_OBJETIVO y TAM_CHOQUE a partir de
 """
 
 import time
-
+import sys 
 import numpy as np
 
 import gymnasium as gym
@@ -37,11 +37,28 @@ except ImportError:
 
 
 try:
-    from robobo_ros2_interfaces.srv import StopWheels, MoveWheels
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.action import ActionClient
+    from rclpy.utilities import remove_ros_args
+    from rcl_interfaces.msg import ParameterDescriptor
+
+    # Import required service and action types
+    from robobo_ros2_interfaces.srv import StopWheels, MoveWheels, MoveWheelsTime as MoveWheelsTimeSrv, MoveWheelsDegrees
     from robobo_ros2_interfaces.msg import BlobArray
+    from robobo_ros2_interfaces.action import MoveWheelsTime as MoveWheelsTimeAction
+    # Aggregate IR (infrared proximity) sensor topic:
+    #   /robobo/robot_<n>/base/ir  ->  std_msgs/msg/Int32MultiArray
+    from std_msgs.msg import Int32
     HAY_INTERFACES_ROBOT = True
-except ImportError:
-    StopWheels = MoveWheels = BlobArray = None
+except ImportError as e:
+    sys.stderr.write(
+        f"[ERROR] Failed to import ROS 2 dependencies: {e}\n"
+        "Please ensure your ROS 2 environment and workspace are sourced:\n"
+        "  Windows:      .\\install\\setup.ps1\n"
+        "  Linux/macOS:  source install/setup.bash\n"
+    )
+    sys.exit(1)
     HAY_INTERFACES_ROBOT = False
 
 AVISO_SIN_SIM = (
@@ -111,11 +128,19 @@ BLOB_VIGENCIA_S = 0.4
 # Límites de velocidad de cada rueda. La acción ya no es (v, w): el
 # robot sólo tiene dos motores, uno por rueda, así que la política
 # decide directamente la velocidad de cada una.
-V_RUEDA_MAX = 0.20
-V_RUEDA_MIN = -0.15
+W_RUEDA_MAX = 360.0
 
+CMD_MAX = 100.0
+CMD_POR_GRADO_S = CMD_MAX / W_RUEDA_MAX
 
 PASO_S = 0.2
+
+
+SIGMA_DIST = 0.35   # tolerancia del error log-distancia (±0.2 ≈ banda actual)
+SIGMA_X = 0.30
+PEN_CHOQUE = 20.0
+PEN_PERDIDO = 10.0
+PEN_FUERA = 20.0
 
 # =====================================================================
 # El entorno
@@ -156,11 +181,13 @@ class RoboboSeguimientoEnv(gym.Env):
     def __init__(self,
                  pasos_max=200,
                  usar_simulador=True,
-                 verbose=False):
+                 verbose=False,
+                 robot_name='0'):
         super().__init__()
 
         self.pasos_max = pasos_max
         self.verbose = verbose
+        self.robot_name = robot_name
 
         # -------------------------------------------------- ROS 2
         if not rclpy.ok():
@@ -175,20 +202,51 @@ class RoboboSeguimientoEnv(gym.Env):
         self._blob_tam = None
         self._blob_t_ultimo = -1.0   # time.time() de la última detección
 
-        self.nodo.create_subscription(
-            BlobArray, NS_SMARTPHONE + '/color_blobs', self._cb_blob, 10)
+        self.base_ns = f'/robobo/robot_{self.robot_name}/base'
+        self.smartphone_ns = f'/robobo/robot_{self.robot_name}/smartphone'
 
-        self.cli_move_wheels = self.nodo.create_client(
-            MoveWheels, NS_BASE + '/move_wheels')
-        self.cli_stop_wheels = self.nodo.create_client(
-            StopWheels, NS_BASE + '/stop_wheels')
-        # Usamos la disponibilidad de move_wheels como comprobación de
-        # que robobo_container está en marcha (ya no hay IR para eso).
-        if not self.cli_move_wheels.wait_for_service(timeout_sec=5.0):
-            raise RuntimeError(
-                'No responde el servicio {}/move_wheels.\n'
-                'Comprobar que robobo_container está en marcha.'
-                .format(NS_BASE))
+        # self.nodo.get_logger().info("==========================================")
+        # self.nodo.get_logger().info("       Robobo ROS 2 Standalone Demo       ")
+        # self.nodo.get_logger().info("==========================================")
+        # self.nodo.get_logger().info(f"Target Robot Name : {self.robot_name}")
+        # self.nodo.get_logger().info(f"Target Base NS    : {self.base_ns}")
+        # self.nodo.get_logger().info("==========================================")
+
+        self.stop_wheels_client = self.nodo.create_client(
+            StopWheels, f'{self.base_ns}/stop_wheels'
+        )
+        self.move_wheels_client = self.nodo.create_client(
+            MoveWheels, f'{self.base_ns}/move_wheels'
+        )
+
+
+        self.move_wheels_degrees_client = self.nodo.create_client(
+            MoveWheelsDegrees, f'{self.base_ns}/move_wheels_degrees'
+        )
+
+        self.latest_color_blob = None
+        self.color_blob_sub = self.nodo.create_subscription(
+            BlobArray, f'{self.smartphone_ns}/color_blobs', self._cb_blob, 10
+        )
+
+        self.move_wheels_time_srv_client = self.nodo.create_client(
+            MoveWheelsTimeSrv, f'{self.base_ns}/move_wheels_time'
+        )
+
+
+        self.move_wheels_time_action_client = ActionClient(
+            self.nodo, MoveWheelsTimeAction, f'{self.base_ns}/move_wheels_time'
+        )
+
+        self.latest_right_wheel_speed = None
+        self.latest_left_wheel_speed = None
+
+        self.right_wheel_speed = self.nodo.create_subscription(
+            Int32, f'{self.base_ns}/wheel/right/speed', self._right_wheel_speed_callback, 10
+        )
+        self.left_wheel_speed = self.nodo.create_subscription(
+            Int32, f'{self.base_ns}/wheel/left/speed', self._left_wheel_speed_callback, 10
+        )
 
         # -------------------------------------------------- simulador
         self.cli_reset = None
@@ -227,11 +285,18 @@ class RoboboSeguimientoEnv(gym.Env):
         self.pasos = 0
         self.en_banda = 0
         self.pasos_perdido = 0
-        self.ultima_accion = np.zeros(2, dtype=np.float32)
+        self.ultima_accion = np.zeros((2,), dtype=np.float32)
 
     # -----------------------------------------------------------------
     # Comunicación con ROS 2
     # -----------------------------------------------------------------
+    def _right_wheel_speed_callback(self, msg):
+        """Store the most recent right wheel speed reading (int)."""
+        self.latest_right_wheel_speed = msg.data
+    
+    def _left_wheel_speed_callback(self, msg):
+        """Store the most recent left wheel speed reading (int)."""
+        self.latest_left_wheel_speed = msg.data
 
     def _cb_blob(self, msg):
         """Se ejecuta cada vez que llega una detección del blob verde.
@@ -254,18 +319,200 @@ class RoboboSeguimientoEnv(gym.Env):
     def _cb_pose_robot_objetivo(self, msg):
         self._pose_robot_objetivo = (msg.position.x, msg.position.z, msg.rotation.y)
 
-    def _mover_ruedas(self, v_izq, v_der):
-        peticion = MoveWheels.Request()
-        peticion.right_speed = float(v_der)
-        peticion.left_speed = float(v_izq)
-        futuro = self.cli_move_wheels.call_async(peticion)
-        rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=1.0)
+    def read_right_wheel_speed(self, timeout_sec=2.0):
+        """Return the most recent right wheel speed reading (int)."""
+        # self.nodo.get_logger().info(f"Reading right wheel speed (topic: {self.base_ns}/wheel/right/speed)...")
+        self.latest_right_wheel_speed = None
+        start_time = time.time()
 
-    def _detener(self):
-        futuro = self.cli_stop_wheels.call_async(StopWheels.Request())
-        rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=1.0)
+        while self.latest_right_wheel_speed is None and (time.time() - start_time) < timeout_sec:
+            rclpy.spin_once(self.nodo, timeout_sec=timeout_sec)
+
+        if self.latest_right_wheel_speed is None:
+            self.nodo.get_logger().warning(
+                f"  -> No right wheel speed data received within {timeout_sec:.1f}s"
+            )
+            return None
+
+        # self.nodo.get_logger().info(f"  -> Wheel speed values (raw): {self.latest_right_wheel_speed}")
+        return self.latest_right_wheel_speed
+
+    def read_left_wheel_speed(self, timeout_sec=2.0):
+        """Return the most recent left wheel speed reading (int)."""
+        # self.nodo.get_logger().info(f"Reading left wheel speed (topic: {self.base_ns}/wheel/left/speed)...")
+        self.latest_left_wheel_speed = None
+        start_time = time.time()
+
+        while self.latest_left_wheel_speed is None and (time.time() - start_time) < timeout_sec:
+            rclpy.spin_once(self.nodo, timeout_sec=timeout_sec)
+
+        if self.latest_left_wheel_speed is None:
+            self.nodo.get_logger().warning(
+                f"  -> No left wheel speed data received within {timeout_sec:.1f}s"
+            )
+            return None
+
+        # self.nodo.get_logger().info(f"  -> Wheel speed values (raw): {self.latest_left_wheel_speed}")
+        return self.latest_left_wheel_speed
+
+    def move_wheels_time(self, right_speed, left_speed, duration):
+        """Send wheel movement action goal synchronously."""
+        # self.nodo.get_logger().info(
+        #     f"Moving wheels: right={right_speed}, left={left_speed} for {duration}s..."
+        # )
+        goal_msg = MoveWheelsTimeAction.Goal()
+        goal_msg.right_speed = float(right_speed)
+        goal_msg.left_speed = float(left_speed)
+        goal_msg.time = float(duration)
+
+        send_goal_future = self.move_wheels_time_action_client.send_goal_async(
+            goal_msg
+        )
+        rclpy.spin_until_future_complete(self, send_goal_future, timeout_sec=5.0)
+
+        if not send_goal_future.done():
+            self.nodo.get_logger().error("  -> Timed out sending wheel movement goal")
+            return False
+
+        goal_handle = send_goal_future.result()
+        if not goal_handle or not goal_handle.accepted:
+            self.nodo.get_logger().error("  -> Wheel movement goal rejected")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(
+            self, result_future, timeout_sec=duration + 10.0
+        )
+
+        if not result_future.done():
+            self.nodo.get_logger().error("  -> Timed out waiting for wheel movement result")
+            return False
+
+        result = result_future.result()
+        success = result.result.success if result and result.result else False
+        # self.nodo.get_logger().info(f"  -> Wheel movement completed (success: {success})")
+        return success
+
+    def move_left_wheel_degrees(self, degrees, speed):
+        """Send left wheel movement action goal synchronously."""
+        # self.nodo.get_logger().info(
+        #     f"Moving left wheel: {degrees} degrees at speed {speed}..."
+        # )
+        req = MoveWheelsDegrees.Request()
+        req.wheel = 'L'
+        req.left_degrees = float(degrees)
+        req.left_speed = float(speed)
+
+        # self.nodo.get_logger().info(f"Setting left wheel degrees to: {req.left_degrees}, speed: {req.left_speed}...")
+
+        future = self.move_wheels_degrees_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+
+        if future.done():
+            try:
+                response = future.result()
+                if response and response.success:
+                    # self.nodo.get_logger().info(f"  -> Wheels moved successfully: {response}")
+                    return True
+                else:
+                    msg = response.message if response else "Empty response"
+                    self.nodo.get_logger().error(f"  -> Failed to move wheels: {msg}")
+            except Exception as e:
+                self.nodo.get_logger().error(f"  -> Error reading move_wheels response: {e}")
+        else:
+            self.nodo.get_logger().error("  -> Call to move_wheels service timed out")
+        return False
+
+    def move_right_wheel_degrees(self, degrees, speed):
+        """Send right wheel movement action goal synchronously."""
+        # self.nodo.get_logger().info(
+        #     f"Moving right wheel: {degrees} degrees at speed {speed}..."
+        # )
+        req = MoveWheelsDegrees.Request()
+        req.wheel = 'R'
+        req.right_degrees = float(degrees)
+        req.right_speed = float(speed)
+
+        future = self.move_wheels_degrees_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+
+        self.nodo.get_logger().info(f"Setting right wheel degrees to: {req.right_degrees}, speed: {req.right_speed}...")
+
+        if future.done():
+            try:
+                response = future.result()
+                if response and response.success:
+                    # self.nodo.get_logger().info(f"  -> Wheels moved successfully: {response}")
+                    return True
+                else:
+                    msg = response.message if response else "Empty response"
+                    self.nodo.get_logger().error(f"  -> Failed to move wheels: {msg}")
+            except Exception as e:
+                self.nodo.get_logger().error(f"  -> Error reading move_wheels response: {e}")
+        else:
+            self.nodo.get_logger().error("  -> Call to move_wheels service timed out")
+        return False
+    def read_color_blob(self, color='green', timeout_sec=2.0):
+        """Wait for and log a fresh reading from the color blob topic.
+
+        Returns a ColorBlob message with position and size information.
+        """
+        # self.nodo.get_logger().info(f"Reading color blob for '{color}' (topic: {self.smartphone_ns}/color_blobs)...")
+        self.latest_color_blob = None
+        start_time = time.time()
+
+        while self.latest_color_blob is None and (time.time() - start_time) < timeout_sec:
+            rclpy.spin_once(self.nodo, timeout_sec=0.1)
+
+        if self.latest_color_blob is None:
+            self.nodo.get_logger().warning(
+                f"  -> No color blob data received within {timeout_sec:.1f}s"
+            )
+            return None
+        for blob in self.latest_color_blob.blobs:
+            if blob.color == color:
+                self.latest_color_blob = blob
+                break
+        # self.nodo.get_logger().info(f"  -> Color blob values: x={self.latest_color_blob.x}, y={self.latest_color_blob.y}, size={self.latest_color_blob.size}")
+        return self.latest_color_blob
+
+    def move_wheels(self, right_speed, left_speed):
+        """Send wheel movement action goal synchronously."""
+        req = MoveWheels.Request()
+        req.right_speed = float(right_speed)
+        req.left_speed = float(left_speed)
+        # self.nodo.get_logger().info(f"Setting wheels speed to R: {right_speed},  L: {left_speed}...")
+
+        future = self.move_wheels_client.call_async(req)
+        rclpy.spin_until_future_complete(self.nodo, future, timeout_sec=5.0)
+
+        if future.done():
+            try:
+                response = future.result()
+                if response and response.success:
+                    # self.nodo.get_logger().info(f"  -> Wheels moved successfully: {response}")
+                    return True
+                else:
+                    msg = response.message if response else "Empty response"
+                    self.nodo.get_logger().error(f"  -> Failed to move wheels: {msg}")
+            except Exception as e:
+                self.nodo.get_logger().error(f"  -> Error reading move_wheels response: {e}")
+        else:
+            self.nodo.get_logger().error("  -> Call to move_wheels service timed out")
+        return False
+
+    def stop_robot(self):
+        """Safely stop wheels and reset LEDs (useful on abort / shutdown)."""
+        try:
+            if self.stop_wheels_client.wait_for_service(timeout_sec=0.5):
+                req = StopWheels.Request()
+                future = self.stop_wheels_client.call_async(req)
+                rclpy.spin_until_future_complete(self.nodo, future, timeout_sec=1.0)
+        except Exception:
+            pass
 
     def _reiniciar_escena(self):
+        self.nodo.get_logger().info("Reiniciando escena...")
         futuro = self.cli_reset.call_async(ResetSimulation.Request())
         rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=5.0)
         if futuro.result() is None or not futuro.result().success:
@@ -304,45 +551,28 @@ class RoboboSeguimientoEnv(gym.Env):
     # Recompensa
     # -----------------------------------------------------------------
 
-    def _recompensa(self, blob_x, tam, visible, accion, perdido, choque, en_banda):
-        """Recompensa del paso
-
-        Cuatro términos:
-
-          1. Conformación: si el blob es visible, penaliza alejarse del
-             tamaño objetivo (mantener la distancia d) y alejarse del
-             centro (mantenerse detrás del robot, no a un lado). Si no es
-             visible, no hay señal de conformación posible y se aplica una
-             penalización fija: evita que la política aprenda a "mirar
-             para otro lado" para no acumular penalización de centrado.
-
-          2. Regularización del giro: se usa la diferencia entre la velocidad 
-             de las dos ruedas (accion está normalizada en [-1, 1] por rueda, 
-             así que la diferencia máxima es 2).
-
-          3. Penalización fuerte por choque (el blob
-             ocupa ya casi toda la imagen)
-
-          4. Pequeña recompensa por paso mientras se está dentro de la
-             banda objetivo (distancia y centrado a la vez)
-
-        """
-        if not visible:
-            r = -1.0
+    def _recompensa(self, blob_x, tam, visible, accion, accion_prev,
+                perdido, choque):
+        if visible:
+            e_d = float(np.log(max(tam, 1e-3) / TAM_OBJETIVO))
+            r_dist = np.exp(-(e_d / SIGMA_DIST) ** 2)
+            r_x = np.exp(-(blob_x / SIGMA_X) ** 2)
+            r = r_dist * r_x                      # pico en [0, 1]
+            r -= 0.2 * min(abs(e_d), 2.0)         # pendiente lejos del objetivo
+            r -= 0.2 * abs(blob_x)
         else:
-            r = -abs(tam - TAM_OBJETIVO)
-            r -= 0.5 * abs(blob_x)
+            r = -1.0
 
-        diferencia_ruedas = abs(float(accion[1]) - float(accion[0])) / 2.0
-        r -= 0.02 * diferencia_ruedas
+        # suavidad: cambios bruscos de acción y giro diferencial
+        r -= 0.05 * float(np.mean(np.abs(accion - accion_prev)))
+        r -= 0.02 * abs(float(accion[1]) - float(accion[0])) / 2.0
 
         if choque:
-            r -= 10.0
+            r -= PEN_CHOQUE
         if perdido:
-            r -= 5.0
-        if en_banda:
-            r += 0.3
-
+            r -= PEN_PERDIDO
+        # if fuera:
+        #     r -= PEN_FUERA
         return float(r)
 
     # -----------------------------------------------------------------
@@ -352,7 +582,7 @@ class RoboboSeguimientoEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self._detener()
+        self.stop_robot()
 
         if self.cli_reset is not None:
             # Reinicia la escena completa
@@ -362,7 +592,7 @@ class RoboboSeguimientoEnv(gym.Env):
         self.pasos = 0
         self.en_banda = 0
         self.pasos_perdido = 0
-        self.ultima_accion = np.zeros(2, dtype=np.float32)
+        self.ultima_accion = np.zeros((2,), dtype=np.float32)
 
         # Se limpia la última detección para no arrastrar una lectura de antes del
         # reinicio, y se confía en _blob_visible() para el resto.
@@ -372,14 +602,18 @@ class RoboboSeguimientoEnv(gym.Env):
         return self._observacion(), {}
 
     def step(self, accion):
+        accion_prev = self.ultima_accion.copy()          # antes de la línea ultima_accion = accion
         accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
         self.ultima_accion = accion
 
-        # Reescalar velocidad de cada rueda por separado
-        v_izq = V_RUEDA_MIN + (accion[0] + 1.0) * 0.5 * (V_RUEDA_MAX - V_RUEDA_MIN)
-        v_der = V_RUEDA_MIN + (accion[1] + 1.0) * 0.5 * (V_RUEDA_MAX - V_RUEDA_MIN)
-        self._mover_ruedas(v_izq, v_der)
-        
+        # Velocidad angular objetivo de cada rueda (grados/s)
+        w_izq = float(accion[0]) * W_RUEDA_MAX
+        w_der = float(accion[1]) * W_RUEDA_MAX
+
+        cmd_izq = float(np.clip(w_izq * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
+        cmd_der = float(np.clip(w_der * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
+
+        self.move_wheels(cmd_der, cmd_izq)
         # Como el topic de blobs es por eventos hace falta seguir haciendo
         # spin durante toda la ventana del paso, o se puede perder la
         # única detección que llegue en ese intervalo.
@@ -410,7 +644,7 @@ class RoboboSeguimientoEnv(gym.Env):
         truncated = bool(self.pasos >= self.pasos_max)
 
         if terminated or truncated:
-            self._detener()
+            self.stop_robot()
 
         distancia_real = None
         if self._pose is not None and self._pose_robot_objetivo is not None:
@@ -432,9 +666,9 @@ class RoboboSeguimientoEnv(gym.Env):
 
         if self.verbose:
             print('paso {:3d}  vis={}  x={:+.3f}  tam={:.3f}  '
-                  'v_izq={:+.3f}  v_der={:+.3f}  r={:+.3f}{}'
+                  'w_izq={:+.0f}  w_der={:+.0f}  r={:+.3f}{}'
                   .format(self.pasos, int(visible), blob_x, blob_tam,
-                          v_izq, v_der, recompensa,
+                          w_izq, w_der, recompensa,
                           '  CHOQUE' if choque else
                           ('  PERDIDO' if perdido else '')))
 
@@ -442,7 +676,7 @@ class RoboboSeguimientoEnv(gym.Env):
 
     def close(self):
         try:
-            self._detener()
+            self.stop_robot()
         except Exception:
             pass
         try:
@@ -558,7 +792,7 @@ def calibrar(avanzar=True):
         maximo, estancado, paso = 0.0, 0, 0
 
         while paso < 200 and estancado < 15:
-            mover(0.03, PASO_S)
+            mover(15, PASO_S)
             paso += 1
 
             vis = blob_visible_ahora()
@@ -579,7 +813,7 @@ def calibrar(avanzar=True):
             else:
                 estancado += 1
 
-        mover(-0.05, 1.0)
+        mover(-20, 1.0)
 
         print('\ntamaño máximo visto  {:6.0f}   <- candidato a '
               'BLOB_TAM_SATURACION'.format(maximo))

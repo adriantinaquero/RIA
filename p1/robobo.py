@@ -9,9 +9,9 @@ try:
     from rcl_interfaces.msg import ParameterDescriptor
 
     # Import required service and action types
-    from robobo_ros2_interfaces.srv import StopWheels, MoveWheels, MoveWheelsTime as MoveWheelsTimeSrv
+    from robobo_ros2_interfaces.srv import StopWheels, MoveWheels, MoveWheelsTime as MoveWheelsTimeSrv, MoveWheelsDegrees as MoveWheelsDegreesSrv
     from robobo_ros2_interfaces.msg import BlobArray
-    from robobo_ros2_interfaces.action import MoveTilt, MoveWheelsTime as MoveWheelsTimeAction
+    from robobo_ros2_interfaces.action import MoveTilt, MoveWheelsTime as MoveWheelsTimeAction, MoveWheelsDegrees as MoveWheelsDegreesAction
     # Aggregate IR (infrared proximity) sensor topic:
     #   /robobo/robot_<n>/base/ir  ->  std_msgs/msg/Int32MultiArray
     from std_msgs.msg import Int32MultiArray, Int32
@@ -60,7 +60,7 @@ def parse_cli_args(args=None):
     return parser.parse_known_args(args)
 
 
-class RoboboDemo(Node):
+class Robobo(Node):
     def __init__(self, robot_name='0', timeout=15.0):
         super().__init__('robobo_demo')
 
@@ -91,6 +91,14 @@ class RoboboDemo(Node):
         )
         self.move_wheels_client = self.create_client(
             MoveWheels, f'{self.base_ns}/move_wheels'
+        )
+
+        self.movel_wheels_degrees_action_client = ActionClient(
+            self, MoveWheelsDegreesAction, f'{self.base_ns}/move_wheels_degrees'
+        )
+
+        self.move_wheels_degrees_srv_client = self.create_client(
+            MoveWheelsDegreesSrv, f'{self.base_ns}/move_wheels_degrees'
         )
 
         self.move_tilt_action_client = ActionClient(
@@ -159,9 +167,10 @@ class RoboboDemo(Node):
                 timeout_sec=0.5
             )
             wheels_ready = self.move_wheels_client.wait_for_service(timeout_sec=0.5)
+            wheels_degrees_ready = self.movel_wheels_degrees_action_client.wait_for_server(timeout_sec=0.5)
             tilt_ready = self.move_tilt_action_client.wait_for_server(timeout_sec=0.5)
             
-            if wheels_ready and tilt_ready and wheels_time_ready:
+            if wheels_ready and tilt_ready and wheels_time_ready and wheels_degrees_ready:
                 self.get_logger().info("-> robobo_container detected! All required services and actions are ready.")
                 return True
 
@@ -300,6 +309,80 @@ class RoboboDemo(Node):
         result = result_future.result()
         success = result.result.success if result and result.result else False
         self.get_logger().info(f"  -> Wheel movement completed (success: {success})")
+        return success
+
+    def move_left_wheel_degrees(self, degrees, speed):
+        """Send left wheel movement action goal synchronously."""
+        self.get_logger().info(
+            f"Moving left wheel: {degrees} degrees at speed {speed}..."
+        )
+        goal_msg = MoveWheelsDegreesAction.Goal()
+        goal_msg.left_degrees = float(degrees)
+        goal_msg.left_speed = float(speed)
+
+        send_goal_future = self.movel_wheels_degrees_action_client.send_goal_async(
+            goal_msg
+        )
+        rclpy.spin_until_future_complete(self, send_goal_future, timeout_sec=5.0)
+
+        if not send_goal_future.done():
+            self.get_logger().error("  -> Timed out sending left wheel movement goal")
+            return False
+
+        goal_handle = send_goal_future.result()
+        if not goal_handle or not goal_handle.accepted:
+            self.get_logger().error("  -> Left wheel movement goal rejected")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(
+            self, result_future, timeout_sec=10.0
+        )
+
+        if not result_future.done():
+            self.get_logger().error("  -> Timed out waiting for left wheel movement result")
+            return False
+
+        result = result_future.result()
+        success = result.result.success if result and result.result else False
+        self.get_logger().info(f"  -> Left wheel movement completed (success: {success})")
+        return success
+
+    def move_right_wheel_degrees(self, degrees, speed):
+        """Send right wheel movement action goal synchronously."""
+        self.get_logger().info(
+            f"Moving right wheel: {degrees} degrees at speed {speed}..."
+        )
+        goal_msg = MoveWheelsDegreesAction.Goal()
+        goal_msg.right_degrees = float(degrees)
+        goal_msg.right_speed = float(speed)
+
+        send_goal_future = self.movel_wheels_degrees_action_client.send_goal_async(
+            goal_msg
+        )
+        rclpy.spin_until_future_complete(self, send_goal_future, timeout_sec=5.0)
+
+        if not send_goal_future.done():
+            self.get_logger().error("  -> Timed out sending right wheel movement goal")
+            return False
+
+        goal_handle = send_goal_future.result()
+        if not goal_handle or not goal_handle.accepted:
+            self.get_logger().error("  -> Right wheel movement goal rejected")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(
+            self, result_future, timeout_sec=10.0
+        )
+
+        if not result_future.done():
+            self.get_logger().error("  -> Timed out waiting for right wheel movement result")
+            return False
+
+        result = result_future.result()
+        success = result.result.success if result and result.result else False
+        self.get_logger().info(f"  -> Right wheel movement completed (success: {success})")
         return success
 
     def read_color_blob(self, color='green', timeout_sec=2.0):
