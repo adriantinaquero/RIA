@@ -106,12 +106,12 @@ BLOB_TAM_SATURACION = 8000.0
 
 # Tamaño de blob que corresponde a la distancia que se quiere mantener,
 # y tolerancia alrededor de ese valor. La hay que calibrar
-TAM_OBJETIVO = 0.30
-TAM_TOLERANCIA = 0.06
+TAM_OBJETIVO = 42
+TAM_TOLERANCIA = 3
 
 # Tamaño de blob a partir del cual se considera que ha colisionado
 # con el otro robot. La hay que calibrar
-TAM_CHOQUE = 0.75
+TAM_CHOQUE = 70
 
 # Desviación horizontal del blob que se tolera 
 # En las mismas unidades que blob_x normalizado ([-1, 1]).
@@ -452,29 +452,6 @@ class RoboboSeguimientoEnv(gym.Env):
         else:
             self.nodo.get_logger().error("  -> Call to move_wheels service timed out")
         return False
-    def read_color_blob(self, color='green', timeout_sec=2.0):
-        """Wait for and log a fresh reading from the color blob topic.
-
-        Returns a ColorBlob message with position and size information.
-        """
-        # self.nodo.get_logger().info(f"Reading color blob for '{color}' (topic: {self.smartphone_ns}/color_blobs)...")
-        self.latest_color_blob = None
-        start_time = time.time()
-
-        while self.latest_color_blob is None and (time.time() - start_time) < timeout_sec:
-            rclpy.spin_once(self.nodo, timeout_sec=0.1)
-
-        if self.latest_color_blob is None:
-            self.nodo.get_logger().warning(
-                f"  -> No color blob data received within {timeout_sec:.1f}s"
-            )
-            return None
-        for blob in self.latest_color_blob.blobs:
-            if blob.color == color:
-                self.latest_color_blob = blob
-                break
-        # self.nodo.get_logger().info(f"  -> Color blob values: x={self.latest_color_blob.x}, y={self.latest_color_blob.y}, size={self.latest_color_blob.size}")
-        return self.latest_color_blob
 
     def move_wheels(self, right_speed, left_speed):
         """Send wheel movement action goal synchronously."""
@@ -523,7 +500,7 @@ class RoboboSeguimientoEnv(gym.Env):
     # -----------------------------------------------------------------
 
     def _blob_visible(self):
-        if self._blob_t_ultimo < 0:
+        if self._blob_tam == 0:
             return False
         return (time.time() - self._blob_t_ultimo) <= BLOB_VIGENCIA_S
 
@@ -690,26 +667,7 @@ class RoboboSeguimientoEnv(gym.Env):
 # =====================================================================
 
 def calibrar(avanzar=True):
-    """Mide blob_x y blob_tam a distintas distancias del robot líder.
-
-    Con avanzar=True (por defecto): asume que el otro está quieto, ya
-    colocado delante del seguidor y dentro de su campo de visión, y hace
-    que el seguidor avance hacia él a pulsos cortos, imprimiendo una fila
-    por pulso con el tamaño del blob. Se detiene si el blob se pierde, si
-    el tamaño deja de crecer varios pulsos seguidos, o si indica que está a punto de chocar
-
-    Con avanzar=False: no mueve el robot, sólo imprime blob_x y blob_tam
-    en continuo. Útil para calibrar varias distancias moviendo al líder
-    entre lecturas sin que el seguidor se mueva de en medio
-
-    De la tabla salen las constantes:
-
-      BLOB_TAM_SATURACION   el tamaño máximo visto, con el líder pegado
-                            al seguidor.
-      TAM_OBJETIVO          el tamaño de la fila en la que la distancia es
-                            la deseada (d), dividido por el anterior.
-      TAM_CHOQUE            un valor intermedio entre el objetivo y 1,0.
-    """
+    """Mide blob_x y blob_tam a distintas distancias del robot líder."""
     if not HAY_INTERFACES_ROBOT:
         raise RuntimeError(AVISO_SIN_ROBOT)
 
@@ -717,8 +675,13 @@ def calibrar(avanzar=True):
         rclpy.init()
     nodo = Node('calibracion_seguir')
 
-    estado = {'blob_x': None, 'blob_tam': None, 'blob_t': -1.0,
-              'pose': None, 'pose_robot_objetivo': None}
+    estado = {
+        'blob_x': None,
+        'blob_tam': None,
+        'blob_t': -1.0,
+        'pose': None,
+        'pose_robot_objetivo': None
+    }
 
     def cb_blob(m):
         for blob in m.blobs:
@@ -749,6 +712,12 @@ def calibrar(avanzar=True):
         return (estado['blob_t'] >= 0
                 and (time.time() - estado['blob_t']) <= BLOB_VIGENCIA_S)
 
+    def spin_for_duration(duration_s):
+        """Procesa callbacks de ROS activamente durante una ventana de tiempo."""
+        t0 = time.time()
+        while time.time() - t0 < duration_s:
+            rclpy.spin_once(nodo, timeout_sec=0.02)
+
     def mover(v, segundos):
         peticion = MoveWheels.Request()
         peticion.right_speed = float(v)
@@ -756,9 +725,8 @@ def calibrar(avanzar=True):
         futuro = cli_move_wheels.call_async(peticion)
         rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=1.0)
 
-        t0 = time.time()
-        while time.time() - t0 < segundos:
-            rclpy.spin_once(nodo, timeout_sec=0.02)
+        # Procesa ROS mientras se mueve
+        spin_for_duration(segundos)
 
         futuro = cli_stop_wheels.call_async(StopWheels.Request())
         rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=1.0)
@@ -766,17 +734,20 @@ def calibrar(avanzar=True):
     def distancia_real():
         if estado['pose'] and estado['pose_robot_objetivo']:
             return ((estado['pose'][0] - estado['pose_robot_objetivo'][0]) ** 2 +
-                     (estado['pose'][1] - estado['pose_robot_objetivo'][1]) ** 2) ** 0.5
+                    (estado['pose'][1] - estado['pose_robot_objetivo'][1]) ** 2) ** 0.5
         return None
 
     cabecera = '{:>4s}  {:>7s}  {:>7s}  {:>4s}  {:>8s}'.format(
         'paso', 'blob_x', 'tam', 'vis', 'distmm')
-        
+
     try:
+        # Esperar 0.5s girando callbacks para recibir la detección inicial de la cámara
+        spin_for_duration(0.5)
+
         if not avanzar:
             print(cabecera)
             while rclpy.ok():
-                rclpy.spin_once(nodo, timeout_sec=0.1)
+                spin_for_duration(0.2)
                 vis = blob_visible_ahora()
                 d = distancia_real()
                 print('{:4s}  {:7s}  {:7s}  {:4d}  {:>8s}'.format(
@@ -785,7 +756,6 @@ def calibrar(avanzar=True):
                     '{:.0f}'.format(estado['blob_tam']) if vis else '--',
                     int(vis),
                     '{:.0f}'.format(d) if d is not None else '--'))
-                time.sleep(0.2)
             return
 
         print(cabecera)
@@ -793,8 +763,11 @@ def calibrar(avanzar=True):
 
         while paso < 200 and estancado < 15:
             mover(15, PASO_S)
-            paso += 1
+            
+            # Un pequeño spin extra para dar tiempo a capturar el frame justo tras parar
+            spin_for_duration(0.1)
 
+            paso += 1
             vis = blob_visible_ahora()
             tam_actual = estado['blob_tam'] if vis else 0.0
             d = distancia_real()
@@ -817,12 +790,6 @@ def calibrar(avanzar=True):
 
         print('\ntamaño máximo visto  {:6.0f}   <- candidato a '
               'BLOB_TAM_SATURACION'.format(maximo))
-        print('\nTAM_OBJETIVO se elige mirando la tabla: el tamaño de la '
-              'fila en la que\nel seguidor está a la distancia d deseada, '
-              'dividido por el máximo.\nSi tenéis el módulo sim cargado, '
-              'la columna distmm da la distancia real\nen milímetros entre '
-              'los dos robots para esa misma fila, que es la forma\nmás '
-              'directa de fijar d.')
 
     except KeyboardInterrupt:
         pass
