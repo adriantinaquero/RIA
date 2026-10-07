@@ -26,9 +26,6 @@ from gymnasium import spaces
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import Int32MultiArray
-from geometry_msgs.msg import Twist
-
 # Interfaces propias del puente para poder reiniciar la escena
 try:
     from robobo_ros2_interfaces.msg import RobotLocation
@@ -38,14 +35,14 @@ except ImportError:
     RobotLocation = ResetSimulation = None
     HAY_INTERFACES_SIM = False
 
-# verificar interfaz de blobs!!
+
 try:
-    from robobo_ros2_interfaces.msg import Blob
-    from robobo_ros2_interfaces.srv import SetActiveBlobs
-    HAY_INTERFACES_BLOB = True
+    from robobo_ros2_interfaces.srv import StopWheels, MoveWheels
+    from robobo_ros2_interfaces.msg import BlobArray
+    HAY_INTERFACES_ROBOT = True
 except ImportError:
-    Blob = SetActiveBlobs = None
-    HAY_INTERFACES_BLOB = False
+    StopWheels = MoveWheels = BlobArray = None
+    HAY_INTERFACES_ROBOT = False
 
 AVISO_SIN_SIM = (
     'No se encuentran las interfaces del módulo sim '
@@ -58,10 +55,12 @@ AVISO_SIN_SIM = (
     'Mientras tanto, el entorno funciona con usar_simulador=False '
     '(--sin-simulador),\ncon los robots repuestos a mano entre episodios.')
 
-AVISO_SIN_BLOB = (
-    'No se encuentran robobo_ros2_interfaces.msg.Blob / srv.SetActiveBlobs.\n'
-    'Comprobar los nombres con\n'
-    '    ros2 interface list | grep -i blob\n')
+AVISO_SIN_ROBOT = (
+    'No se encuentran robobo_ros2_interfaces.srv.MoveWheels/StopWheels o '
+    'robobo_ros2_interfaces.msg.BlobArray.\n'
+    'La terminal no tiene cargado el espacio de trabajo del puente, o el '
+    'paquete de interfaces instalado es anterior a estos mensajes:\n'
+    '         source /opt/ros/robobo/setup.bash\n')
 
 
 # =====================================================================
@@ -77,6 +76,10 @@ NS_SIM = '/robobo/robot_0/sim'
 NS_SIM_ROBOT_OBJETIVO = '/robobo/robot_1/sim'
 
 # BLOB VERDE
+
+# Color por el que se filtra dentro de BlobArray.msg.blobs.
+COLOR_BLOB = 'green'
+
 # posx del blob en [0, 100], donde 50 es el centro de la imagen.
 BLOB_X_CENTRO = 50.0
 
@@ -111,10 +114,6 @@ BLOB_VIGENCIA_S = 0.4
 V_RUEDA_MAX = 0.20
 V_RUEDA_MIN = -0.15
 
-# Separación entre ruedas (m), sólo para pasar de (v_izq, v_der) a
-# (v, w) justo antes de publicar en cmd_vel, que sigue siendo un Twist.
-# Es un valor aproximado
-EJE_RUEDAS = 0.085
 
 PASO_S = 0.2
 
@@ -169,35 +168,27 @@ class RoboboSeguimientoEnv(gym.Env):
 
         self.nodo = Node('seguir_entorno_rl')
 
-        self.pub_vel = self.nodo.create_publisher(Twist, NS_BASE + '/cmd_vel', 10)
-
-        if not HAY_INTERFACES_BLOB:
-            raise RuntimeError(AVISO_SIN_BLOB)
+        if not HAY_INTERFACES_ROBOT:
+            raise RuntimeError(AVISO_SIN_ROBOT)
 
         self._blob_posx = None
         self._blob_tam = None
         self._blob_t_ultimo = -1.0   # time.time() de la última detección
 
         self.nodo.create_subscription(
-            Blob, NS_SMARTPHONE + '/blob/green', self._cb_blob, 10)
+            BlobArray, NS_SMARTPHONE + '/color_blobs', self._cb_blob, 10)
 
-        cli_set_blobs = self.nodo.create_client(
-            SetActiveBlobs, NS_SMARTPHONE + '/set_active_blobs')
-        if not cli_set_blobs.wait_for_service(timeout_sec=5.0):
+        self.cli_move_wheels = self.nodo.create_client(
+            MoveWheels, NS_BASE + '/move_wheels')
+        self.cli_stop_wheels = self.nodo.create_client(
+            StopWheels, NS_BASE + '/stop_wheels')
+        # Usamos la disponibilidad de move_wheels como comprobación de
+        # que robobo_container está en marcha (ya no hay IR para eso).
+        if not self.cli_move_wheels.wait_for_service(timeout_sec=5.0):
             raise RuntimeError(
-                'No responde el servicio {}/set_active_blobs.\n'
-                'Revisa el nombre real del servicio (ver aviso al '
-                'principio del archivo).'.format(NS_SMARTPHONE))
-        peticion = SetActiveBlobs.Request()
-        peticion.red = False
-        peticion.green = True
-        peticion.blue = False
-        peticion.custom = False
-        futuro = cli_set_blobs.call_async(peticion)
-        rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=5.0)
-        if futuro.result() is None:
-            raise RuntimeError(
-                'No se pudo activar el rastreo del blob verde.')
+                'No responde el servicio {}/move_wheels.\n'
+                'Comprobar que robobo_container está en marcha.'
+                .format(NS_BASE))
 
         # -------------------------------------------------- simulador
         self.cli_reset = None
@@ -250,9 +241,12 @@ class RoboboSeguimientoEnv(gym.Env):
         para esperar aquí; se guarda el momento de la detección y
         _blob_visible() decide, por antigüedad, si todavía es de fiar.
         """
-        self._blob_posx = float(msg.posx)
-        self._blob_tam = float(msg.size)
-        self._blob_t_ultimo = time.time()
+        for blob in msg.blobs:
+            if blob.color == COLOR_BLOB:
+                self._blob_x = float(blob.x)
+                self._blob_tam = float(blob.size)
+                self._blob_t_ultimo = time.time()
+                break
 
     def _cb_pose(self, msg):
         self._pose = (msg.position.x, msg.position.z, msg.rotation.y)
@@ -260,16 +254,16 @@ class RoboboSeguimientoEnv(gym.Env):
     def _cb_pose_robot_objetivo(self, msg):
         self._pose_robot_objetivo = (msg.position.x, msg.position.z, msg.rotation.y)
 
-    def _publicar_velocidad(self, v, w):
-        msg = Twist()
-        msg.linear.x = float(v)
-        msg.angular.z = float(w)
-        self.pub_vel.publish(msg)
+    def _mover_ruedas(self, v_izq, v_der):
+        peticion = MoveWheels.Request()
+        peticion.right_speed = float(v_der)
+        peticion.left_speed = float(v_izq)
+        futuro = self.cli_move_wheels.call_async(peticion)
+        rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=1.0)
 
     def _detener(self):
-        for _ in range(3):
-            self._publicar_velocidad(0.0, 0.0)
-            time.sleep(0.05)
+        futuro = self.cli_stop_wheels.call_async(StopWheels.Request())
+        rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=1.0)
 
     def _reiniciar_escena(self):
         futuro = self.cli_reset.call_async(ResetSimulation.Request())
@@ -291,7 +285,7 @@ class RoboboSeguimientoEnv(gym.Env):
         visible = self._blob_visible()
         if visible:
             blob_x = float(np.clip(
-                (self._blob_posx - BLOB_X_CENTRO) / BLOB_X_CENTRO, -1.0, 1.0))
+                (self._blob_x - BLOB_X_CENTRO) / BLOB_X_CENTRO, -1.0, 1.0))
             blob_tam = float(np.clip(
                 self._blob_tam / BLOB_TAM_SATURACION, 0.0, 1.0))
         else:
@@ -384,12 +378,8 @@ class RoboboSeguimientoEnv(gym.Env):
         # Reescalar velocidad de cada rueda por separado
         v_izq = V_RUEDA_MIN + (accion[0] + 1.0) * 0.5 * (V_RUEDA_MAX - V_RUEDA_MIN)
         v_der = V_RUEDA_MIN + (accion[1] + 1.0) * 0.5 * (V_RUEDA_MAX - V_RUEDA_MIN)
-
-        # y convertir a (v, w) sólo para publicar en cmd_vel (Twist).
-        v = (v_izq + v_der) / 2.0
-        w = (v_der - v_izq) / EJE_RUEDAS
-        self._publicar_velocidad(v, w)
-
+        self._mover_ruedas(v_izq, v_der)
+        
         # Como el topic de blobs es por eventos hace falta seguir haciendo
         # spin durante toda la ventana del paso, o se puede perder la
         # única detección que llegue en ese intervalo.
@@ -486,8 +476,8 @@ def calibrar(avanzar=True):
                             la deseada (d), dividido por el anterior.
       TAM_CHOQUE            un valor intermedio entre el objetivo y 1,0.
     """
-    if not HAY_INTERFACES_BLOB:
-        raise RuntimeError(AVISO_SIN_BLOB)
+    if not HAY_INTERFACES_ROBOT:
+        raise RuntimeError(AVISO_SIN_ROBOT)
 
     if not rclpy.ok():
         rclpy.init()
@@ -497,22 +487,14 @@ def calibrar(avanzar=True):
               'pose': None, 'pose_robot_objetivo': None}
 
     def cb_blob(m):
-        estado['blob_x'] = float(m.posx)
-        estado['blob_tam'] = float(m.size)
-        estado['blob_t'] = time.time()
+        for blob in m.blobs:
+            if blob.color == COLOR_BLOB:
+                estado['blob_x'] = float(blob.x)
+                estado['blob_tam'] = float(blob.size)
+                estado['blob_t'] = time.time()
+                break
 
-    nodo.create_subscription(Blob, NS_SMARTPHONE + '/blob/green', cb_blob, 10)
-
-    cli_set_blobs = nodo.create_client(
-        SetActiveBlobs, NS_SMARTPHONE + '/set_active_blobs')
-    if cli_set_blobs.wait_for_service(timeout_sec=5.0):
-        peticion = SetActiveBlobs.Request()
-        peticion.red = False
-        peticion.green = True
-        peticion.blue = False
-        peticion.custom = False
-        fut = cli_set_blobs.call_async(peticion)
-        rclpy.spin_until_future_complete(nodo, fut, timeout_sec=5.0)
+    nodo.create_subscription(BlobArray, NS_SMARTPHONE + '/color_blobs', cb_blob, 10)
 
     if HAY_INTERFACES_SIM:
         nodo.create_subscription(
@@ -522,23 +504,30 @@ def calibrar(avanzar=True):
             RobotLocation, NS_SIM_ROBOT_OBJETIVO + '/robot_location',
             lambda m: estado.__setitem__('pose_robot_objetivo', (m.position.x, m.position.z)), 1)
 
-    pub = nodo.create_publisher(Twist, NS_BASE + '/cmd_vel', 10)
+    cli_move_wheels = nodo.create_client(MoveWheels, NS_BASE + '/move_wheels')
+    cli_stop_wheels = nodo.create_client(StopWheels, NS_BASE + '/stop_wheels')
+    if not cli_move_wheels.wait_for_service(timeout_sec=5.0):
+        raise RuntimeError(
+            'No responde el servicio {}/move_wheels. ¿Está en marcha '
+            'robobo_container?'.format(NS_BASE))
 
     def blob_visible_ahora():
         return (estado['blob_t'] >= 0
                 and (time.time() - estado['blob_t']) <= BLOB_VIGENCIA_S)
 
     def mover(v, segundos):
-        msg = Twist()
-        msg.linear.x = float(v)
+        peticion = MoveWheels.Request()
+        peticion.right_speed = float(v)
+        peticion.left_speed = float(v)
+        futuro = cli_move_wheels.call_async(peticion)
+        rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=1.0)
+
         t0 = time.time()
         while time.time() - t0 < segundos:
-            pub.publish(msg)
             rclpy.spin_once(nodo, timeout_sec=0.02)
-        msg.linear.x = 0.0
-        for _ in range(3):
-            pub.publish(msg)
-            time.sleep(0.05)
+
+        futuro = cli_stop_wheels.call_async(StopWheels.Request())
+        rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=1.0)
 
     def distancia_real():
         if estado['pose'] and estado['pose_robot_objetivo']:
@@ -546,8 +535,9 @@ def calibrar(avanzar=True):
                      (estado['pose'][1] - estado['pose_robot_objetivo'][1]) ** 2) ** 0.5
         return None
 
-    cabecera = '{:>4s}  {:>8s}  {:>7s}  {:>7s}  {:>4s}  {:>7s}  {:>8s}'.format(
-        'paso', 'avance', 'blob_x', 'tam', 'vis', 'distmm')
+    cabecera = '{:>4s}  {:>7s}  {:>7s}  {:>4s}  {:>8s}'.format(
+        'paso', 'blob_x', 'tam', 'vis', 'distmm')
+        
     try:
         if not avanzar:
             print(cabecera)
@@ -604,7 +594,8 @@ def calibrar(avanzar=True):
         pass
     finally:
         try:
-            mover(0.0, 0.1)
+            futuro = cli_stop_wheels.call_async(StopWheels.Request())
+            rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=1.0)
         except Exception:
             pass
         nodo.destroy_node()
