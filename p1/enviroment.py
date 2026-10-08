@@ -46,7 +46,7 @@ try:
     # Import required service and action types
     from robobo_ros2_interfaces.srv import StopWheels, MoveWheels, MoveWheelsTime as MoveWheelsTimeSrv, MoveWheelsDegrees
     from robobo_ros2_interfaces.msg import BlobArray
-    from robobo_ros2_interfaces.action import MoveWheelsTime as MoveWheelsTimeAction
+    from robobo_ros2_interfaces.action import MoveTilt, MoveWheelsTime as MoveWheelsTimeAction
     # Aggregate IR (infrared proximity) sensor topic:
     #   /robobo/robot_<n>/base/ir  ->  std_msgs/msg/Int32MultiArray
     from std_msgs.msg import Int32
@@ -102,7 +102,7 @@ BLOB_X_CENTRO = 50.0
 
 # El tamaño (área en píxeles) crece al acercarse. Hay que normalizarla
 # dividiendo por la constante calibrada y recortando a [0, 1]
-BLOB_TAM_SATURACION = 8000.0
+BLOB_TAM_SATURACION = 69.0
 
 # Tamaño de blob que corresponde a la distancia que se quiere mantener,
 # y tolerancia alrededor de ese valor. La hay que calibrar
@@ -125,22 +125,49 @@ PASOS_PERDIDO_MAX = 15
 BLOB_VIGENCIA_S = 0.4
 
 
-# Límites de velocidad de cada rueda. La acción ya no es (v, w): el
-# robot sólo tiene dos motores, uno por rueda, así que la política
-# decide directamente la velocidad de cada una.
-W_RUEDA_MAX = 360.0
+W_RUEDA_MAX = 180.0
 
-CMD_MAX = 100.0
+CMD_MAX = 50.0
 CMD_POR_GRADO_S = CMD_MAX / W_RUEDA_MAX
 
 PASO_S = 0.2
 
 
-SIGMA_DIST = 0.35   # tolerancia del error log-distancia (±0.2 ≈ banda actual)
+# --- Umbrales en las MISMAS unidades que blob_tam (normalizado a [0, 1]) ---
+# TAM_OBJETIVO, TAM_TOLERANCIA y TAM_CHOQUE están calibrados en píxeles,
+# pero la observación y la recompensa trabajan con el tamaño normalizado.
+TAM_OBJ_N = TAM_OBJETIVO / BLOB_TAM_SATURACION
+TAM_TOL_N = TAM_TOLERANCIA / BLOB_TAM_SATURACION
+TAM_CHOQUE_N = min(TAM_CHOQUE / BLOB_TAM_SATURACION, 1.0)
+
+# --- Recompensa ---
+# Error de distancia en escala logarítmica, e_d = ln(tam / tam_objetivo):
+#   e_d > 0 -> demasiado cerca,  e_d < 0 -> demasiado lejos.
+# Asimétrico: estar demasiado cerca es más peligroso (choque) que estar
+# algo lejos, así que la campana es más estrecha por ese lado.
+SIGMA_DIST_CERCA = 0.25
+SIGMA_DIST_LEJOS = 0.40
 SIGMA_X = 0.30
+
+# Pesos de cada término. Se SUMAN (no se multiplican) para que el
+# gradiente de la distancia no desaparezca cuando el blob está descentrado,
+# ni al revés.
+W_DIST = 0.6
+W_X = 0.4
+OFFSET_BASE = 0.5       # desplaza la recompensa base a [-0.5, 0.5]
+BONUS_BANDA = 0.5       # extra por estar a la vez en distancia y centrado
+R_PERDIDO_PASO = -1.0   # recompensa por paso sin ver el blob
+
+# Shaping basado en potencial (Ng et al. 1999): premia ACERCARSE a la
+# posición ideal y castiga alejarse, sin cambiar la política óptima.
+K_SHAPE = 2.0
+GAMMA_RL = 0.99         # debe coincidir con gamma de SAC
+E_D_MAX = 2.0           # saturación del error de distancia en el potencial
+
 PEN_CHOQUE = 20.0
 PEN_PERDIDO = 10.0
-PEN_FUERA = 20.0
+PEN_SUAVIDAD = 0.05
+PEN_GIRO = 0.02
 
 # =====================================================================
 # El entorno
@@ -238,6 +265,10 @@ class RoboboSeguimientoEnv(gym.Env):
             self.nodo, MoveWheelsTimeAction, f'{self.base_ns}/move_wheels_time'
         )
 
+        self.move_tilt_action_client = ActionClient(
+            self.nodo, MoveTilt, f'{self.base_ns}/move_tilt'
+        )
+
         self.latest_right_wheel_speed = None
         self.latest_left_wheel_speed = None
 
@@ -274,18 +305,19 @@ class RoboboSeguimientoEnv(gym.Env):
 
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
-            low=np.array([-1.0, 0.0, 0.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
-            dtype=np.float32)
+    low=np.array([-1.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32),
+    high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+    dtype=np.float32)
 
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+            low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 
         # -------------------------------------------------- estado
         self.pasos = 0
         self.en_banda = 0
         self.pasos_perdido = 0
-        self.ultima_accion = np.zeros((2,), dtype=np.float32)
+        self._phi_prev = None
+        self.ultima_accion = np.zeros((4,), dtype=np.float32)
 
     # -----------------------------------------------------------------
     # Comunicación con ROS 2
@@ -318,6 +350,37 @@ class RoboboSeguimientoEnv(gym.Env):
 
     def _cb_pose_robot_objetivo(self, msg):
         self._pose_robot_objetivo = (msg.position.x, msg.position.z, msg.rotation.y)
+
+    def move_tilt(self, angle, speed=20.0):
+        """Send tilt motor action goal synchronously."""
+        # self.nodo.get_logger().info(f"Moving tilt motor to {angle}° (speed: {speed})...")
+        goal_msg = MoveTilt.Goal()
+        goal_msg.angle = float(angle)
+        goal_msg.speed = float(speed)
+
+        send_goal_future = self.move_tilt_action_client.send_goal_async(goal_msg)
+        rclpy.spin_until_future_complete(self.nodo, send_goal_future, timeout_sec=5.0)
+
+        if not send_goal_future.done():
+            self.nodo.get_logger().error("  -> Timed out sending tilt goal")
+            return False
+
+        goal_handle = send_goal_future.result()
+        if not goal_handle or not goal_handle.accepted:
+            self.nodo.get_logger().error("  -> Tilt movement goal rejected")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self.nodo, result_future, timeout_sec=10.0)
+
+        if not result_future.done():
+            self.nodo.get_logger().error("  -> Timed out waiting for tilt result")
+            return False
+
+        result = result_future.result()
+        success = result.result.success if result and result.result else False
+        # self.nodo.get_logger().info(f"  -> Tilt movement completed (success: {success})")
+        return success
 
     def read_right_wheel_speed(self, timeout_sec=2.0):
         """Return the most recent right wheel speed reading (int)."""
@@ -528,29 +591,40 @@ class RoboboSeguimientoEnv(gym.Env):
     # Recompensa
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def _error_dist(tam):
+        """ln(tam/objetivo): >0 demasiado cerca, <0 demasiado lejos."""
+        return float(np.log(max(tam, 1e-3) / TAM_OBJ_N))
+
+    def _potencial(self, visible, blob_x, tam):
+        """Potencial phi(s) en [-K_SHAPE, 0]; máximo (0) en la posición ideal."""
+        if not visible:
+            return -K_SHAPE
+        e = min(abs(self._error_dist(tam)), E_D_MAX) / E_D_MAX
+        return -K_SHAPE * (W_DIST * e + W_X * min(abs(blob_x), 1.0))
+
     def _recompensa(self, blob_x, tam, visible, accion, accion_prev,
-                perdido, choque):
-        if visible:
-            e_d = float(np.log(max(tam, 1e-3) / TAM_OBJETIVO))
-            r_dist = np.exp(-(e_d / SIGMA_DIST) ** 2)
-            r_x = np.exp(-(blob_x / SIGMA_X) ** 2)
-            r = r_dist * r_x                      # pico en [0, 1]
-            r -= 0.2 * min(abs(e_d), 2.0)         # pendiente lejos del objetivo
-            r -= 0.2 * abs(blob_x)
-        else:
-            r = -1.0
-
-        # suavidad: cambios bruscos de acción y giro diferencial
-        r -= 0.05 * float(np.mean(np.abs(accion - accion_prev)))
-        r -= 0.02 * abs(float(accion[1]) - float(accion[0])) / 2.0
-
+                    perdido, choque, en_banda_ahora=False):
         if choque:
-            r -= PEN_CHOQUE
-        if perdido:
-            r -= PEN_PERDIDO
-        # if fuera:
-        #     r -= PEN_FUERA
-        return float(r)
+            return -20.0
+        if perdido or not visible:
+            return -2.0
+
+        # ---- 1) término principal: distancia + centrado ----
+        e_x = abs(blob_x)
+    
+        # Error de tamaño respecto al objetivo
+        e_tam = abs(tam - TAM_OBJ_N) / max(TAM_OBJ_N, 1.0 - TAM_OBJ_N)
+        e_tam = min(e_tam, 1.0)
+
+        # Recompensa continua en el rango (0, 1] cuando está bien posicionado
+        r_posicion = (1.0 - e_x) * 0.5 + (1.0 - e_tam) * 0.5
+
+        # Bonus adicional si se encuentra dentro de la tolerancia deseada
+        if e_x <= X_TOLERANCIA and abs(tam - TAM_OBJ_N) <= TAM_TOL_N:
+            r_posicion += 0.5
+
+        return float(r_posicion)
 
     # -----------------------------------------------------------------
     # Interfaz de Gymnasium
@@ -569,13 +643,14 @@ class RoboboSeguimientoEnv(gym.Env):
         self.pasos = 0
         self.en_banda = 0
         self.pasos_perdido = 0
-        self.ultima_accion = np.zeros((2,), dtype=np.float32)
+        self._phi_prev = None
+        self.ultima_accion = np.zeros((4,), dtype=np.float32)
 
         # Se limpia la última detección para no arrastrar una lectura de antes del
         # reinicio, y se confía en _blob_visible() para el resto.
         self._blob_t_ultimo = -1.0
         rclpy.spin_once(self.nodo, timeout_sec=0.1)
-
+        self.move_tilt(110, speed=20.0)  # mirar hacia abajo para ver el blob
         return self._observacion(), {}
 
     def step(self, accion):
@@ -583,12 +658,19 @@ class RoboboSeguimientoEnv(gym.Env):
         accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
         self.ultima_accion = accion
 
-        # Velocidad angular objetivo de cada rueda (grados/s)
-        w_izq = float(accion[0]) * W_RUEDA_MAX
-        w_der = float(accion[1]) * W_RUEDA_MAX
+        v_izq = accion[0]
+        w_izq = accion[1]
+        v_der = accion[2]
+        w_der = accion[3]
 
-        cmd_izq = float(np.clip(w_izq * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
-        cmd_der = float(np.clip(w_der * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
+        velocidad_izq_norm = np.clip(v_izq + w_izq, -1.0, 1.0)
+        velocidad_der_norm = np.clip(v_der + w_der, -1.0, 1.0)
+
+        w_izq_final = float(velocidad_izq_norm) * W_RUEDA_MAX
+        w_der_final = float(velocidad_der_norm) * W_RUEDA_MAX
+
+        cmd_izq = float(np.clip(w_izq_final * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
+        cmd_der = float(np.clip(w_der_final * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
 
         self.move_wheels(cmd_der, cmd_izq)
         # Como el topic de blobs es por eventos hace falta seguir haciendo
@@ -606,16 +688,17 @@ class RoboboSeguimientoEnv(gym.Env):
         else:
             self.pasos_perdido += 1
 
-        choque = visible and blob_tam >= TAM_CHOQUE
+        choque = visible and blob_tam >= TAM_CHOQUE_N
         perdido = self.pasos_perdido >= PASOS_PERDIDO_MAX
 
         en_banda_ahora = (visible
-                          and abs(blob_tam - TAM_OBJETIVO) <= TAM_TOLERANCIA
+                          and abs(blob_tam - TAM_OBJ_N) <= TAM_TOL_N
                           and abs(blob_x) <= X_TOLERANCIA)
         self.en_banda = self.en_banda + 1 if en_banda_ahora else 0
 
         recompensa = self._recompensa(
-            blob_x, blob_tam, visible, accion, perdido, choque, en_banda_ahora)
+            blob_x, blob_tam, visible, accion, accion_prev,
+            perdido, choque, en_banda_ahora)
 
         terminated = bool(choque or perdido)
         truncated = bool(self.pasos >= self.pasos_max)
