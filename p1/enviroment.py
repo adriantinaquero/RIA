@@ -28,7 +28,7 @@ from rclpy.node import Node
 
 # Interfaces propias del puente para poder reiniciar la escena
 from robobo_ros2_interfaces.msg import RobotLocation    #TODO
-from robobo_ros2_interfaces.srv import ResetSimulation#, GetSimObjects, GetSimObjectLocation
+from robobo_ros2_interfaces.srv import ResetSimulation#, GetSimObjectLocation
 
 
 try:
@@ -289,7 +289,7 @@ class RoboboSeguimientoEnv(gym.Env):
 
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
-            # [blob_x, blob_tam, visible, ultima_accion_izq, ultima_accion_der]
+            # [blob_x, blob_tam, visible, ultima_accion_v, ultima_accion_w]
         low=np.array([-1.0, 0.0, 0.0, -1.0, -1.0], dtype=np.float32),
         high=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
         dtype=np.float32)
@@ -636,8 +636,8 @@ class RoboboSeguimientoEnv(gym.Env):
         e = min(abs(self._error_dist(tam)), E_D_MAX) / E_D_MAX
         return -K_SHAPE * (W_DIST * e + W_X * min(abs(blob_x), 1.0))
 
-    def _recompensa(self, blob_x, tam, visible, accion, accion_prev,
-                    perdido, choque, en_banda_ahora=False):
+    def _recompensa(self, blob_x, dist, visible, accion, accion_prev,
+                    perdido, choque):
         if choque:
             return -20.0
         if perdido:
@@ -646,15 +646,14 @@ class RoboboSeguimientoEnv(gym.Env):
         # ---- 1) término principal: distancia + centrado ----
         e_x = abs(blob_x)
     
-        # Error de tamaño respecto al objetivo
-        e_tam = abs(tam - TAM_OBJ_N) / max(TAM_OBJ_N, 1.0 - TAM_OBJ_N)
-        e_tam = min(e_tam, 1.0)
+        # Error de distancia respecto al objetivo
+        e_dist = abs(dist)
 
         # Recompensa continua en el rango (0, 1] cuando está bien posicionado
-        r_posicion = (1.0 - e_x) * 0.5 + (1.0 - e_tam) * 0.5
+        r_posicion = (1.0 - e_x) * 0.5 + (1.0 - e_dist) * 0.5
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
-        if e_x <= X_TOLERANCIA and abs(tam - TAM_OBJ_N) <= TAM_TOL_N:
+        if e_x <= X_TOLERANCIA and BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
             r_posicion += 0.5
 
         return float(r_posicion)/max(self.pasos_perdido, 1)
@@ -715,12 +714,16 @@ class RoboboSeguimientoEnv(gym.Env):
         self.pasos += 1
 
         visible, blob_x, blob_tam = self._leer_blob()
+        print(self._blob_tam)
+        dist = (-238.76 * np.log(self._blob_tam) + 1557.47)/1000
+        print(dist)
+
         if visible:
             self.pasos_perdido = 0
         else:
             self.pasos_perdido += 1
 
-        choque = visible and blob_tam >= TAM_CHOQUE_N
+        choque = visible and dist <= DIST_CHOQUE_M
         perdido = self.pasos_perdido >= PASOS_PERDIDO_MAX
 
         en_banda_ahora = (visible
@@ -730,7 +733,7 @@ class RoboboSeguimientoEnv(gym.Env):
 
         recompensa = self._recompensa(
             blob_x, blob_tam, visible, accion, accion_prev,
-            perdido, choque, en_banda_ahora)
+            perdido, choque)
 
         terminated = bool(choque or perdido)
         truncated = bool(self.pasos >= self.pasos_max)
@@ -867,6 +870,7 @@ def calibrar(avanzar=True):
     #     return (futuro.result().position.x, futuro.result().position.z)
 
     def distancia_real():
+        print(estado['pose'], estado['pose_robot_objetivo'])
         if estado['pose'] and estado['pose_robot_objetivo']:
             return ((estado['pose'][0] - estado['pose_robot_objetivo'][0]) ** 2 +
                     (estado['pose'][1] - estado['pose_robot_objetivo'][1]) ** 2) ** 0.5
