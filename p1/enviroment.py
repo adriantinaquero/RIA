@@ -95,22 +95,9 @@ COLOR_BLOB = 'green'
 # posx del blob en [0, 100], donde 50 es el centro de la imagen.
 BLOB_X_CENTRO = 50.0
 
-# El tamaño (área en píxeles) crece al acercarse. Hay que normalizarla
-# dividiendo por la constante calibrada y recortando a [0, 1]
-BLOB_TAM_SATURACION = 480
-
-# Tamaño de blob que corresponde a la distancia que se quiere mantener,
-# y tolerancia alrededor de ese valor. La hay que calibrar
-TAM_OBJETIVO = 150
-TAM_TOLERANCIA = 15
-
-# Tamaño de blob a partir del cual se considera que ha colisionado
-# con el otro robot. La hay que calibrar
-TAM_CHOQUE = 300
-
-#TODO: transformar todo a metros
 DIST_CHOQUE_M = 0.12
 DIST_PERDIDO_M = 0.9
+DIST_TARGET_M = 0.3
 BANDA_OBJETIVO_M = [0.2, 0.45]
 
 
@@ -119,39 +106,19 @@ BANDA_OBJETIVO_M = [0.2, 0.45]
 X_TOLERANCIA = 0.15
 
 # Pasos consecutivos sin ver el blob antes de dar el episodio por perdido.
-PASOS_PERDIDO_MAX = 15
+PASOS_PERDIDO_MAX = 4
 
 # Tiempo máximo desde la última detección del blob para seguir
 # considerándolo "visible ahora mismo"
 BLOB_VIGENCIA_S = 0.4
 
-V_MIN = 0.05
-V_MAX = 0.1
-W_MAX = 1.0
+V_MIN = 0.01
+V_MAX = 0.075
+W_MAX = 0.35
 
-PASO_S = 0.2
+PASO_S = 0.2/4
 
 ESPERA_MAX_S = 1.0
-
-# --- Umbrales en las MISMAS unidades que blob_tam (normalizado a [0, 1]) ---
-# TAM_OBJETIVO, TAM_TOLERANCIA y TAM_CHOQUE están calibrados en píxeles,
-# pero la observación y la recompensa trabajan con el tamaño normalizado.
-TAM_OBJ_N = TAM_OBJETIVO / BLOB_TAM_SATURACION
-TAM_TOL_N = TAM_TOLERANCIA / BLOB_TAM_SATURACION
-TAM_CHOQUE_N = min(TAM_CHOQUE / BLOB_TAM_SATURACION, 1.0)
-
-
-# Pesos de cada término. Se SUMAN (no se multiplican) para que el
-# gradiente de la distancia no desaparezca cuando el blob está descentrado,
-# ni al revés.
-W_DIST = 0.6
-W_X = 0.4
-
-# Shaping basado en potencial (Ng et al. 1999): premia ACERCARSE a la
-# posición ideal y castiga alejarse, sin cambiar la política óptima.
-K_SHAPE = 2.0
-GAMMA_RL = 0.99         # debe coincidir con gamma de SAC
-E_D_MAX = 2.0           # saturación del error de distancia en el potencial
 
 # =====================================================================
 # El entorno
@@ -210,7 +177,7 @@ class RoboboSeguimientoEnv(gym.Env):
             raise RuntimeError(AVISO_SIN_ROBOT)
 
         self._blob_posx = None
-        self._blob_tam = None
+        self._dist = None
         self._blob_t_ultimo = -1.0   # time.time() de la última detección
 
         self.base_ns = f'/robobo/robot_{self.robot_name}/base'
@@ -290,7 +257,7 @@ class RoboboSeguimientoEnv(gym.Env):
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
             # [blob_x, blob_tam, visible, ultima_accion_v, ultima_accion_w]
-        low=np.array([-1.0, 0.0, 0.0, -1.0, -1.0], dtype=np.float32),
+        low=np.array([-1.0, -1.0, 0.0, -1.0, -1.0], dtype=np.float32),
         high=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
         dtype=np.float32)
 
@@ -327,7 +294,7 @@ class RoboboSeguimientoEnv(gym.Env):
         for blob in msg.blobs:
             if blob.color == COLOR_BLOB:
                 self._blob_x = float(blob.x)
-                self._blob_tam = float(blob.size)
+                self._dist = (-238.76 * np.log(blob.size) + 1557.47)/1000
                 self._blob_t_ultimo = time.time()
                 self._n_ir += 1
                 break
@@ -596,7 +563,7 @@ class RoboboSeguimientoEnv(gym.Env):
     # -----------------------------------------------------------------
 
     def _blob_visible(self):
-        if self._blob_tam == 0:
+        if self._dist == float('inf'):
             return False
         return (time.time() - self._blob_t_ultimo) <= BLOB_VIGENCIA_S
 
@@ -606,17 +573,17 @@ class RoboboSeguimientoEnv(gym.Env):
         if visible:
             blob_x = float(np.clip(
                 (self._blob_x - BLOB_X_CENTRO) / BLOB_X_CENTRO, -1.0, 1.0))
-            blob_tam = float(np.clip(
-                self._blob_tam / BLOB_TAM_SATURACION, 0.0, 1.0))
+            dist = float(np.clip(
+                (self._dist - DIST_TARGET_M) / DIST_TARGET_M, -1.0, 1.0))
         else:
-            blob_x, blob_tam = 0.0, 0.0
-        return visible, blob_x, blob_tam
+            blob_x, dist = 0.0, 0.0
+        return visible, blob_x, dist
 
 
     def _observacion(self):
-        visible, blob_x, blob_tam = self._leer_blob()
+        visible, blob_x, dist = self._leer_blob()
         return np.array(
-            [blob_x, blob_tam, 1.0 if visible else 0.0] +
+            [blob_x, dist, 1.0 if visible else 0.0] +
             list(self.ultima_accion),
             dtype=np.float32)
 
@@ -624,22 +591,10 @@ class RoboboSeguimientoEnv(gym.Env):
     # Recompensa
     # -----------------------------------------------------------------
 
-    @staticmethod
-    def _error_dist(tam):
-        """ln(tam/objetivo): >0 demasiado cerca, <0 demasiado lejos."""
-        return float(np.log(max(tam, 1e-3) / TAM_OBJ_N))
-
-    def _potencial(self, visible, blob_x, tam):
-        """Potencial phi(s) en [-K_SHAPE, 0]; máximo (0) en la posición ideal."""
-        if not visible:
-            return -K_SHAPE
-        e = min(abs(self._error_dist(tam)), E_D_MAX) / E_D_MAX
-        return -K_SHAPE * (W_DIST * e + W_X * min(abs(blob_x), 1.0))
-
     def _recompensa(self, blob_x, dist, visible, accion, accion_prev,
                     perdido, choque):
         if choque:
-            return -20.0
+            return -5.0
         if perdido:
             return -2.0
 
@@ -650,13 +605,16 @@ class RoboboSeguimientoEnv(gym.Env):
         e_dist = abs(dist)
 
         # Recompensa continua en el rango (0, 1] cuando está bien posicionado
-        r_posicion = (1.0 - e_x) * 0.5 + (1.0 - e_dist) * 0.5
+        r_posicion = (1.0 - e_x) * 0.4 + (1.0 - e_dist) * 0.6
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
         if e_x <= X_TOLERANCIA and BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
             r_posicion += 0.5
-
-        return float(r_posicion)/max(self.pasos_perdido, 1)
+        if not visible:
+            r_posicion -= 0.75
+        
+        r_posicion -= (abs(accion[1])**2)/2
+        return float(r_posicion)
 
     # -----------------------------------------------------------------
     # Interfaz de Gymnasium
@@ -686,13 +644,13 @@ class RoboboSeguimientoEnv(gym.Env):
         return self._observacion(), {}
 
     def step(self, accion):
-        if self.pasos >= 6:
+        if self.pasos >= 4:
             accion_prev = self.ultima_accion
             accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
             self.ultima_accion = accion
         else:
             accion_prev = self.ultima_accion
-            accion = np.array([-0.75, 0.0], dtype=np.float32) 
+            accion = np.array([-0.6, 0.0], dtype=np.float32) 
             self.ultima_accion = accion
             
         # 1. Reescalar la acción normalizada a unidades del SI y enviarla.
@@ -704,19 +662,14 @@ class RoboboSeguimientoEnv(gym.Env):
         # Como el topic de blobs es por eventos hace falta seguir haciendo
         # spin durante toda la ventana del paso, o se puede perder la
         # única detección que llegue en ese intervalo.
-        t0 = time.time()
-        while time.time() - t0 < PASO_S:
-            rclpy.spin_once(self.nodo, timeout_sec=0.02)
+        time.sleep(PASO_S)
 
         self._vaciar_cola()
         self._esperar_lectura_nueva()
 
         self.pasos += 1
 
-        visible, blob_x, blob_tam = self._leer_blob()
-        print(self._blob_tam)
-        dist = (-238.76 * np.log(self._blob_tam) + 1557.47)/1000
-        print(dist)
+        visible, blob_x, dist = self._leer_blob()
 
         if visible:
             self.pasos_perdido = 0
@@ -727,12 +680,12 @@ class RoboboSeguimientoEnv(gym.Env):
         perdido = self.pasos_perdido >= PASOS_PERDIDO_MAX
 
         en_banda_ahora = (visible
-                          and abs(blob_tam - TAM_OBJ_N) <= TAM_TOL_N
+                          and abs(BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1])
                           and abs(blob_x) <= X_TOLERANCIA)
         self.en_banda = self.en_banda + 1 if en_banda_ahora else 0
 
         recompensa = self._recompensa(
-            blob_x, blob_tam, visible, accion, accion_prev,
+            blob_x, dist, visible, accion, accion_prev,
             perdido, choque)
 
         terminated = bool(choque or perdido)
@@ -749,7 +702,7 @@ class RoboboSeguimientoEnv(gym.Env):
 
         info = {
             'blob_x': blob_x,
-            'blob_tam': blob_tam,
+            'dist': dist,
             'visible': visible,
             'choque': choque,
             'perdido': perdido,
@@ -758,11 +711,11 @@ class RoboboSeguimientoEnv(gym.Env):
             'pose_sim_robot_objetivo': self._pose_robot_objetivo,
             'distancia_real_mm': distancia_real,
         }
-        self.nodo.get_logger().info(f"{recompensa}, blob: {blob_x:.3f}, {blob_tam:.3f}, visible: {visible}, choque: {choque}, perdido: {perdido}, pasos: {self.pasos}, en_banda_consecutivos: {self.en_banda}")
+        self.nodo.get_logger().info(f"{recompensa}, blob: {blob_x:.3f}, {dist:.3f}, visible: {visible}, choque: {choque}, perdido: {perdido}, pasos: {self.pasos}, en_banda_consecutivos: {self.en_banda}")
         if self.verbose:
             print('paso {:3d}  vis={}  x={:+.3f}  tam={:.3f}  '
                   'v={:+.3f}  w={:+.3f}  r={:+.3f}{}'
-                  .format(self.pasos, int(visible), blob_x, blob_tam,
+                  .format(self.pasos, int(visible), blob_x, dist,
                           v, w, recompensa,
                           '  CHOQUE' if choque else
                           ('  PERDIDO' if perdido else '')))
