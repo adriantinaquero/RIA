@@ -28,7 +28,7 @@ from rclpy.node import Node
 
 # Interfaces propias del puente para poder reiniciar la escena
 from robobo_ros2_interfaces.msg import RobotLocation    #TODO
-from robobo_ros2_interfaces.srv import ResetSimulation, #GetSimObjects, GetSimObjectLocation
+from robobo_ros2_interfaces.srv import ResetSimulation#, GetSimObjects, GetSimObjectLocation
 
 
 try:
@@ -125,11 +125,13 @@ PASOS_PERDIDO_MAX = 15
 # considerándolo "visible ahora mismo"
 BLOB_VIGENCIA_S = 0.4
 
-V_MIN = 5
-V_MAX = 45
+V_MIN = 0.05
+V_MAX = 0.1
+W_MAX = 1.0
 
 PASO_S = 0.2
 
+ESPERA_MAX_S = 1.0
 
 # --- Umbrales en las MISMAS unidades que blob_tam (normalizado a [0, 1]) ---
 # TAM_OBJETIVO, TAM_TOLERANCIA y TAM_CHOQUE están calibrados en píxeles,
@@ -267,8 +269,6 @@ class RoboboSeguimientoEnv(gym.Env):
         self.cli_reset = None
         self._pose = None
         self._pose_robot_objetivo = None
-        if usar_simulador and not HAY_INTERFACES_SIM:
-            raise RuntimeError(AVISO_SIN_SIM)
         if usar_simulador:
             self.cli_reset = self.nodo.create_client(
                 ResetSimulation, NS_SIM + '/reset_simulation')
@@ -688,9 +688,11 @@ class RoboboSeguimientoEnv(gym.Env):
 
     def step(self, accion):
         if self.pasos >= 6:
+            accion_prev = self.ultima_accion
             accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
             self.ultima_accion = accion
         else:
+            accion_prev = self.ultima_accion
             accion = np.array([-0.75, 0.0], dtype=np.float32) 
             self.ultima_accion = accion
             
