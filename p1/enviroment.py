@@ -27,13 +27,8 @@ import rclpy
 from rclpy.node import Node
 
 # Interfaces propias del puente para poder reiniciar la escena
-try:
-    from robobo_ros2_interfaces.msg import RobotLocation
-    from robobo_ros2_interfaces.srv import ResetSimulation
-    HAY_INTERFACES_SIM = True
-except ImportError:
-    RobotLocation = ResetSimulation = None
-    HAY_INTERFACES_SIM = False
+from robobo_ros2_interfaces.msg import RobotLocation    #TODO
+from robobo_ros2_interfaces.srv import ResetSimulation, #GetSimObjects, GetSimObjectLocation
 
 
 try:
@@ -42,13 +37,13 @@ try:
     from rclpy.action import ActionClient
     from rclpy.utilities import remove_ros_args
     from rcl_interfaces.msg import ParameterDescriptor
+    from geometry_msgs.msg import Twist
 
     # Import required service and action types
     from robobo_ros2_interfaces.srv import StopWheels, MoveWheels, MoveWheelsTime as MoveWheelsTimeSrv, MoveWheelsDegrees
     from robobo_ros2_interfaces.msg import BlobArray
     from robobo_ros2_interfaces.action import MoveTilt, MoveWheelsTime as MoveWheelsTimeAction
-    # Aggregate IR (infrared proximity) sensor topic:
-    #   /robobo/robot_<n>/base/ir  ->  std_msgs/msg/Int32MultiArray
+
     from std_msgs.msg import Int32
     HAY_INTERFACES_ROBOT = True
 except ImportError as e:
@@ -102,16 +97,22 @@ BLOB_X_CENTRO = 50.0
 
 # El tamaño (área en píxeles) crece al acercarse. Hay que normalizarla
 # dividiendo por la constante calibrada y recortando a [0, 1]
-BLOB_TAM_SATURACION = 69.0
+BLOB_TAM_SATURACION = 480
 
 # Tamaño de blob que corresponde a la distancia que se quiere mantener,
 # y tolerancia alrededor de ese valor. La hay que calibrar
-TAM_OBJETIVO = 42
-TAM_TOLERANCIA = 3
+TAM_OBJETIVO = 150
+TAM_TOLERANCIA = 15
 
 # Tamaño de blob a partir del cual se considera que ha colisionado
 # con el otro robot. La hay que calibrar
-TAM_CHOQUE = 70
+TAM_CHOQUE = 300
+
+#TODO: transformar todo a metros
+DIST_CHOQUE_M = 0.12
+DIST_PERDIDO_M = 0.9
+BANDA_OBJETIVO_M = [0.2, 0.45]
+
 
 # Desviación horizontal del blob que se tolera 
 # En las mismas unidades que blob_x normalizado ([-1, 1]).
@@ -124,11 +125,8 @@ PASOS_PERDIDO_MAX = 15
 # considerándolo "visible ahora mismo"
 BLOB_VIGENCIA_S = 0.4
 
-
-W_RUEDA_MAX = 180.0
-
-CMD_MAX = 50.0
-CMD_POR_GRADO_S = CMD_MAX / W_RUEDA_MAX
+V_MIN = 5
+V_MAX = 45
 
 PASO_S = 0.2
 
@@ -140,34 +138,18 @@ TAM_OBJ_N = TAM_OBJETIVO / BLOB_TAM_SATURACION
 TAM_TOL_N = TAM_TOLERANCIA / BLOB_TAM_SATURACION
 TAM_CHOQUE_N = min(TAM_CHOQUE / BLOB_TAM_SATURACION, 1.0)
 
-# --- Recompensa ---
-# Error de distancia en escala logarítmica, e_d = ln(tam / tam_objetivo):
-#   e_d > 0 -> demasiado cerca,  e_d < 0 -> demasiado lejos.
-# Asimétrico: estar demasiado cerca es más peligroso (choque) que estar
-# algo lejos, así que la campana es más estrecha por ese lado.
-SIGMA_DIST_CERCA = 0.25
-SIGMA_DIST_LEJOS = 0.40
-SIGMA_X = 0.30
 
 # Pesos de cada término. Se SUMAN (no se multiplican) para que el
 # gradiente de la distancia no desaparezca cuando el blob está descentrado,
 # ni al revés.
 W_DIST = 0.6
 W_X = 0.4
-OFFSET_BASE = 0.5       # desplaza la recompensa base a [-0.5, 0.5]
-BONUS_BANDA = 0.5       # extra por estar a la vez en distancia y centrado
-R_PERDIDO_PASO = -1.0   # recompensa por paso sin ver el blob
 
 # Shaping basado en potencial (Ng et al. 1999): premia ACERCARSE a la
 # posición ideal y castiga alejarse, sin cambiar la política óptima.
 K_SHAPE = 2.0
 GAMMA_RL = 0.99         # debe coincidir con gamma de SAC
 E_D_MAX = 2.0           # saturación del error de distancia en el potencial
-
-PEN_CHOQUE = 20.0
-PEN_PERDIDO = 10.0
-PEN_SUAVIDAD = 0.05
-PEN_GIRO = 0.02
 
 # =====================================================================
 # El entorno
@@ -206,7 +188,7 @@ class RoboboSeguimientoEnv(gym.Env):
     metadata = {'render_modes': []}
 
     def __init__(self,
-                 pasos_max=200,
+                 pasos_max=600,
                  usar_simulador=True,
                  verbose=False,
                  robot_name='0'):
@@ -279,6 +261,8 @@ class RoboboSeguimientoEnv(gym.Env):
             Int32, f'{self.base_ns}/wheel/left/speed', self._left_wheel_speed_callback, 10
         )
 
+        self.pub_vel = self.nodo.create_publisher(Twist, NS_BASE + '/cmd_vel', 10)
+
         # -------------------------------------------------- simulador
         self.cli_reset = None
         self._pose = None
@@ -305,19 +289,21 @@ class RoboboSeguimientoEnv(gym.Env):
 
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
-    low=np.array([-1.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32),
-    high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
-    dtype=np.float32)
+            # [blob_x, blob_tam, visible, ultima_accion_izq, ultima_accion_der]
+        low=np.array([-1.0, 0.0, 0.0, -1.0, -1.0], dtype=np.float32),
+        high=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+        dtype=np.float32)
 
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+            low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
         # -------------------------------------------------- estado
         self.pasos = 0
         self.en_banda = 0
         self.pasos_perdido = 0
-        self._phi_prev = None
-        self.ultima_accion = np.zeros((4,), dtype=np.float32)
+        self._n_ir = 0
+        self.ultima_accion = np.zeros((2,), dtype=np.float32)
+
 
     # -----------------------------------------------------------------
     # Comunicación con ROS 2
@@ -343,6 +329,7 @@ class RoboboSeguimientoEnv(gym.Env):
                 self._blob_x = float(blob.x)
                 self._blob_tam = float(blob.size)
                 self._blob_t_ultimo = time.time()
+                self._n_ir += 1
                 break
 
     def _cb_pose(self, msg):
@@ -541,6 +528,12 @@ class RoboboSeguimientoEnv(gym.Env):
             self.nodo.get_logger().error("  -> Call to move_wheels service timed out")
         return False
 
+    def _publicar_velocidad(self, v, w):
+        msg = Twist()
+        msg.linear.x = float(v)
+        msg.angular.z = float(w)
+        self.pub_vel.publish(msg)
+
     def stop_robot(self):
         """Safely stop wheels and reset LEDs (useful on abort / shutdown)."""
         try:
@@ -557,7 +550,47 @@ class RoboboSeguimientoEnv(gym.Env):
         rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=5.0)
         if futuro.result() is None or not futuro.result().success:
             raise RuntimeError('El reinicio de la escena ha fallado.')
+    
+    def _vaciar_cola(self):
+        """Descarta los mensajes pendientes.
 
+        Se llama justo antes de pedir la observación del paso. Todo lo
+        que hay en la cola en ese momento se publicó ANTES o DURANTE la
+        aplicación de la acción, y por tanto no refleja necesariamente su
+        efecto completo.
+        """
+        for _ in range(100):
+            antes = self._n_ir
+            rclpy.spin_once(self.nodo, timeout_sec=0.0)
+            if self._n_ir == antes:
+                return
+
+    def _esperar_lectura_nueva(self, inicial=False):
+        """Bloquea hasta recibir una lectura POSTERIOR a este instante.
+
+        Éste es el punto delicado de acoplar Gymnasium con ROS 2.
+        Gymnasium exige que step() devuelva la observación resultante de
+        la acción; ROS 2 entrega los mensajes cuando quiere. Si se
+        devuelve sin más la última lectura guardada, se devuelve una
+        observación ANTERIOR a la acción aplicada.
+
+        El fallo no produce ningún error: el entrenamiento se ejecuta
+        con normalidad y simplemente no converge, porque la pareja
+        (observación, acción) que recibe el algoritmo está desplazada un
+        paso en el tiempo.
+        """
+        objetivo = self._n_ir + 1
+        t0 = time.time()
+        while self._n_ir < objetivo:
+            rclpy.spin_once(self.nodo, timeout_sec=0.05)
+            if time.time() - t0 > ESPERA_MAX_S:
+                raise RuntimeError(
+                    'No llegan lecturas de {}/color_blobs.\n'
+                    'Comprobar que robobo_container está en ejecución y '
+                    'conectado al simulador.'.format(NS_BASE)
+                    if inicial else
+                    'Se ha interrumpido el flujo de lecturas de los '
+                    'blobs durante el episodio.')
     # -----------------------------------------------------------------
     # Observación
     # -----------------------------------------------------------------
@@ -607,7 +640,7 @@ class RoboboSeguimientoEnv(gym.Env):
                     perdido, choque, en_banda_ahora=False):
         if choque:
             return -20.0
-        if perdido or not visible:
+        if perdido:
             return -2.0
 
         # ---- 1) término principal: distancia + centrado ----
@@ -624,7 +657,7 @@ class RoboboSeguimientoEnv(gym.Env):
         if e_x <= X_TOLERANCIA and abs(tam - TAM_OBJ_N) <= TAM_TOL_N:
             r_posicion += 0.5
 
-        return float(r_posicion)
+        return float(r_posicion)/max(self.pasos_perdido, 1)
 
     # -----------------------------------------------------------------
     # Interfaz de Gymnasium
@@ -644,7 +677,7 @@ class RoboboSeguimientoEnv(gym.Env):
         self.en_banda = 0
         self.pasos_perdido = 0
         self._phi_prev = None
-        self.ultima_accion = np.zeros((4,), dtype=np.float32)
+        self.ultima_accion = np.zeros((2,), dtype=np.float32)
 
         # Se limpia la última detección para no arrastrar una lectura de antes del
         # reinicio, y se confía en _blob_visible() para el resto.
@@ -654,31 +687,28 @@ class RoboboSeguimientoEnv(gym.Env):
         return self._observacion(), {}
 
     def step(self, accion):
-        accion_prev = self.ultima_accion.copy()          # antes de la línea ultima_accion = accion
-        accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
-        self.ultima_accion = accion
+        if self.pasos >= 6:
+            accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
+            self.ultima_accion = accion
+        else:
+            accion = np.array([-0.75, 0.0], dtype=np.float32) 
+            self.ultima_accion = accion
+            
+        # 1. Reescalar la acción normalizada a unidades del SI y enviarla.
+        #    El puente traduce el Twist a velocidades de rueda.
+        v = V_MIN + (accion[0] + 1.0) * 0.5 * (V_MAX - V_MIN)
+        w = float(accion[1]) * W_MAX
+        self._publicar_velocidad(v, w)
 
-        v_izq = accion[0]
-        w_izq = accion[1]
-        v_der = accion[2]
-        w_der = accion[3]
-
-        velocidad_izq_norm = np.clip(v_izq + w_izq, -1.0, 1.0)
-        velocidad_der_norm = np.clip(v_der + w_der, -1.0, 1.0)
-
-        w_izq_final = float(velocidad_izq_norm) * W_RUEDA_MAX
-        w_der_final = float(velocidad_der_norm) * W_RUEDA_MAX
-
-        cmd_izq = float(np.clip(w_izq_final * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
-        cmd_der = float(np.clip(w_der_final * CMD_POR_GRADO_S, -CMD_MAX, CMD_MAX))
-
-        self.move_wheels(cmd_der, cmd_izq)
         # Como el topic de blobs es por eventos hace falta seguir haciendo
         # spin durante toda la ventana del paso, o se puede perder la
         # única detección que llegue en ese intervalo.
         t0 = time.time()
         while time.time() - t0 < PASO_S:
             rclpy.spin_once(self.nodo, timeout_sec=0.02)
+
+        self._vaciar_cola()
+        self._esperar_lectura_nueva()
 
         self.pasos += 1
 
@@ -723,12 +753,12 @@ class RoboboSeguimientoEnv(gym.Env):
             'pose_sim_robot_objetivo': self._pose_robot_objetivo,
             'distancia_real_mm': distancia_real,
         }
-
+        self.nodo.get_logger().info(f"{recompensa}, blob: {blob_x:.3f}, {blob_tam:.3f}, visible: {visible}, choque: {choque}, perdido: {perdido}, pasos: {self.pasos}, en_banda_consecutivos: {self.en_banda}")
         if self.verbose:
             print('paso {:3d}  vis={}  x={:+.3f}  tam={:.3f}  '
-                  'w_izq={:+.0f}  w_der={:+.0f}  r={:+.3f}{}'
+                  'v={:+.3f}  w={:+.3f}  r={:+.3f}{}'
                   .format(self.pasos, int(visible), blob_x, blob_tam,
-                          w_izq, w_der, recompensa,
+                          v, w, recompensa,
                           '  CHOQUE' if choque else
                           ('  PERDIDO' if perdido else '')))
 
@@ -776,13 +806,16 @@ def calibrar(avanzar=True):
 
     nodo.create_subscription(BlobArray, NS_SMARTPHONE + '/color_blobs', cb_blob, 10)
 
-    if HAY_INTERFACES_SIM:
-        nodo.create_subscription(
-            RobotLocation, NS_SIM + '/robot_location',
-            lambda m: estado.__setitem__('pose', (m.position.x, m.position.z)), 1)
-        nodo.create_subscription(
-            RobotLocation, NS_SIM_ROBOT_OBJETIVO + '/robot_location',
-            lambda m: estado.__setitem__('pose_robot_objetivo', (m.position.x, m.position.z)), 1)
+    nodo.create_subscription(
+        RobotLocation, NS_SIM + '/robot_location',
+        lambda m: estado.__setitem__('pose', (m.position.x, m.position.z)), 1)
+    nodo.create_subscription(
+        RobotLocation, NS_SIM_ROBOT_OBJETIVO + '/robot_location',
+        lambda m: estado.__setitem__('pose_robot_objetivo', (m.position.x, m.position.z)), 1)
+    
+    #TODO
+    # cli_get_objects = nodo.create_client(GetSimObjects, NS_SIM + '/get_objects')
+    # cli_get_location = nodo.create_client(GetSimObjectLocation, NS_SIM + '/get_object_location')
 
     cli_move_wheels = nodo.create_client(MoveWheels, NS_BASE + '/move_wheels')
     cli_stop_wheels = nodo.create_client(StopWheels, NS_BASE + '/stop_wheels')
@@ -814,6 +847,23 @@ def calibrar(avanzar=True):
         futuro = cli_stop_wheels.call_async(StopWheels.Request())
         rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=1.0)
 
+    #TODO
+    # def lista_objetos_sim():
+    #     futuro = cli_get_objects.call_async(GetSimObjects.Request())
+    #     rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=5.0)
+    #     if futuro.result() is None:
+    #         raise RuntimeError('No se ha podido obtener la lista de objetos del simulador.')
+    #     return [o.name for o in futuro.result().objects]
+    
+    # def obtener_ubicacion_objeto_sim(nombre_objeto):
+    #     peticion = GetSimObjectLocation.Request()
+    #     peticion.name = nombre_objeto
+    #     futuro = cli_get_location.call_async(peticion)
+    #     rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=5.0)
+    #     if futuro.result() is None:
+    #         raise RuntimeError(f'No se ha podido obtener la ubicación del objeto "{nombre_objeto}" en el simulador.')
+    #     return (futuro.result().position.x, futuro.result().position.z)
+
     def distancia_real():
         if estado['pose'] and estado['pose_robot_objetivo']:
             return ((estado['pose'][0] - estado['pose_robot_objetivo'][0]) ** 2 +
@@ -826,7 +876,8 @@ def calibrar(avanzar=True):
     try:
         # Esperar 0.5s girando callbacks para recibir la detección inicial de la cámara
         spin_for_duration(0.5)
-
+        #TODO
+        # print(lista_objetos_sim())
         if not avanzar:
             print(cabecera)
             while rclpy.ok():
