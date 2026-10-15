@@ -101,7 +101,7 @@ BLOB_TAM_SATURACION = 480
 
 # Tamaño de blob que corresponde a la distancia que se quiere mantener,
 # y tolerancia alrededor de ese valor. La hay que calibrar
-TAM_OBJETIVO = 150
+TAM_OBJETIVO = 40
 TAM_TOLERANCIA = 15
 
 # Tamaño de blob a partir del cual se considera que ha colisionado
@@ -119,7 +119,7 @@ BANDA_OBJETIVO_M = [0.2, 0.45]
 X_TOLERANCIA = 0.15
 
 # Pasos consecutivos sin ver el blob antes de dar el episodio por perdido.
-PASOS_PERDIDO_MAX = 15
+PASOS_PERDIDO_MAX = 5
 
 # Tiempo máximo desde la última detección del blob para seguir
 # considerándolo "visible ahora mismo"
@@ -147,11 +147,6 @@ TAM_CHOQUE_N = min(TAM_CHOQUE / BLOB_TAM_SATURACION, 1.0)
 W_DIST = 0.6
 W_X = 0.4
 
-# Shaping basado en potencial (Ng et al. 1999): premia ACERCARSE a la
-# posición ideal y castiga alejarse, sin cambiar la política óptima.
-K_SHAPE = 2.0
-GAMMA_RL = 0.99         # debe coincidir con gamma de SAC
-E_D_MAX = 2.0           # saturación del error de distancia en el potencial
 
 # =====================================================================
 # El entorno
@@ -548,8 +543,8 @@ class RoboboSeguimientoEnv(gym.Env):
         self.nodo.get_logger().info("Reiniciando escena...")
         futuro = self.cli_reset.call_async(ResetSimulation.Request())
         rclpy.spin_until_future_complete(self.nodo, futuro, timeout_sec=5.0)
-        if futuro.result() is None or not futuro.result().success:
-            raise RuntimeError('El reinicio de la escena ha fallado.')
+        # if futuro.result() is None or not futuro.result().success:
+        #     raise RuntimeError('El reinicio de la escena ha fallado.')
     
     def _vaciar_cola(self):
         """Descarta los mensajes pendientes.
@@ -624,18 +619,6 @@ class RoboboSeguimientoEnv(gym.Env):
     # Recompensa
     # -----------------------------------------------------------------
 
-    @staticmethod
-    def _error_dist(tam):
-        """ln(tam/objetivo): >0 demasiado cerca, <0 demasiado lejos."""
-        return float(np.log(max(tam, 1e-3) / TAM_OBJ_N))
-
-    def _potencial(self, visible, blob_x, tam):
-        """Potencial phi(s) en [-K_SHAPE, 0]; máximo (0) en la posición ideal."""
-        if not visible:
-            return -K_SHAPE
-        e = min(abs(self._error_dist(tam)), E_D_MAX) / E_D_MAX
-        return -K_SHAPE * (W_DIST * e + W_X * min(abs(blob_x), 1.0))
-
     def _recompensa(self, blob_x, tam, visible, accion, accion_prev,
                     perdido, choque, en_banda_ahora=False):
         if choque:
@@ -651,7 +634,7 @@ class RoboboSeguimientoEnv(gym.Env):
         e_tam = min(e_tam, 1.0)
 
         # Recompensa continua en el rango (0, 1] cuando está bien posicionado
-        r_posicion = (1.0 - e_x) * 0.5 + (1.0 - e_tam) * 0.5
+        r_posicion = (1.0 - e_x) * 0.2 + (1.0 - e_tam) * 0.8
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
         if e_x <= X_TOLERANCIA and abs(tam - TAM_OBJ_N) <= TAM_TOL_N:
@@ -702,6 +685,15 @@ class RoboboSeguimientoEnv(gym.Env):
         w = float(accion[1]) * W_MAX
         self._publicar_velocidad(v, w)
 
+        # 2. Dejar que la acción surta efecto. Durante esta espera no se
+        #    hace spin: los mensajes que llegan se acumulan y se
+        #    descartarán en el paso siguiente.
+        time.sleep(PASO_S)
+
+        # 3. Vaciar la cola y esperar una lectura posterior a la acción.
+        self._vaciar_cola()
+        self._esperar_lectura_nueva()
+
         # Como el topic de blobs es por eventos hace falta seguir haciendo
         # spin durante toda la ventana del paso, o se puede perder la
         # única detección que llegue en ese intervalo.
@@ -709,9 +701,7 @@ class RoboboSeguimientoEnv(gym.Env):
         while time.time() - t0 < PASO_S:
             rclpy.spin_once(self.nodo, timeout_sec=0.02)
 
-        self._vaciar_cola()
-        self._esperar_lectura_nueva()
-
+        # 4. Evaluar el resultado.
         self.pasos += 1
 
         visible, blob_x, blob_tam = self._leer_blob()
