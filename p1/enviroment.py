@@ -258,7 +258,7 @@ class RoboboSeguimientoEnv(gym.Env):
 
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
-            # [blob_x, dist, visible, ultimo_blob_x, ultima_accion_v, ultima_accion_w]
+        # [blob_x, dist, visible, ultimo_blob_x, ultima_accion_v, ultima_accion_w]
         low=np.array([-1.0, -1.0, 0.0, -1, -1.0, -1.0], dtype=np.float32),
         high=np.array([1.0, 1.0, 1.0, 1, 1.0, 1.0], dtype=np.float32),
         dtype=np.float32)
@@ -616,11 +616,14 @@ class RoboboSeguimientoEnv(gym.Env):
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
         if e_x <= X_TOLERANCIA and BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
-            r_posicion += 0.5
+            r_posicion += 0.75
         
         
         r_posicion -= abs(accion_prev[1]-accion[1])/10
-        r_posicion -= abs(accion_prev[0]-accion[0])/5
+
+        if BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
+            r_posicion -= abs(accion_prev[0]-accion[0])**2
+        
         return float(r_posicion)
 
     # -----------------------------------------------------------------
