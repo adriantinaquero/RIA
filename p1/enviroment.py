@@ -98,7 +98,8 @@ BLOB_X_CENTRO = 50.0
 DIST_CHOQUE_M = 0.12
 DIST_PERDIDO_M = 0.9
 DIST_TARGET_M = 0.3
-BANDA_OBJETIVO_M = [0.2, 0.45]
+BANDA_OBJETIVO_M = np.array([0.2, 0.45])
+NORM_BANDA_OBJETIVO = (BANDA_OBJETIVO_M - DIST_TARGET_M)/DIST_TARGET_M  
 
 
 # Desviación horizontal del blob que se tolera 
@@ -119,6 +120,9 @@ W_MAX = 0.35
 PASO_S = 0.2
 
 ESPERA_MAX_S = 1.0
+
+SIGMA = 0.18
+MU = 0.0
 
 # =====================================================================
 # El entorno
@@ -607,21 +611,20 @@ class RoboboSeguimientoEnv(gym.Env):
             return -0.25 * self.pasos_perdido
         # ---- 1) término principal: distancia + centrado ----
         e_x = abs(blob_x)
-    
-        # Error de distancia respecto al objetivo
-        e_dist = abs(dist)
 
+        # Error de distancia respecto al objetivo
+        reward_e_dist = np.exp(-((dist - MU) ** 2) / (2 * SIGMA ** 2)) / (SIGMA * np.sqrt(2 * np.pi))
         # Recompensa continua en el rango (0, 1] cuando está bien posicionado
-        r_posicion = (1.0 - e_x) * 0.4 + (1.0 - e_dist) * 0.6
+        r_posicion = (1.0 - e_x) * 0.4 + reward_e_dist * 0.6
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
-        if e_x <= X_TOLERANCIA and BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
+        if e_x <= X_TOLERANCIA and NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
             r_posicion += 0.75
         
         
         r_posicion -= abs(accion_prev[1]-accion[1])/10
 
-        if BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
+        if NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
             r_posicion -= abs(accion_prev[0]-accion[0])**2
         
         return float(r_posicion)
