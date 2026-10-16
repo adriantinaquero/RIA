@@ -112,11 +112,11 @@ PASOS_PERDIDO_MAX = 4
 # considerándolo "visible ahora mismo"
 BLOB_VIGENCIA_S = 0.4
 
-V_MIN = 0.01
-V_MAX = 0.075
+V_MIN = 0.02
+V_MAX = 0.15
 W_MAX = 0.35
 
-PASO_S = 0.2/4
+PASO_S = 0.2
 
 ESPERA_MAX_S = 1.0
 
@@ -178,6 +178,8 @@ class RoboboSeguimientoEnv(gym.Env):
 
         self._blob_posx = None
         self._dist = None
+        self._last_blob_x = None
+        self._last_seen_blob_x = 0.0
         self._blob_t_ultimo = -1.0   # time.time() de la última detección
 
         self.base_ns = f'/robobo/robot_{self.robot_name}/base'
@@ -256,9 +258,9 @@ class RoboboSeguimientoEnv(gym.Env):
 
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
-            # [blob_x, blob_tam, visible, ultima_accion_v, ultima_accion_w]
-        low=np.array([-1.0, -1.0, 0.0, -1.0, -1.0], dtype=np.float32),
-        high=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            # [blob_x, dist, visible, ultimo_blob_x, ultima_accion_v, ultima_accion_w]
+        low=np.array([-1.0, -1.0, 0.0, -1, -1.0, -1.0], dtype=np.float32),
+        high=np.array([1.0, 1.0, 1.0, 1, 1.0, 1.0], dtype=np.float32),
         dtype=np.float32)
 
         self.action_space = spaces.Box(
@@ -268,6 +270,7 @@ class RoboboSeguimientoEnv(gym.Env):
         self.pasos = 0
         self.en_banda = 0
         self.pasos_perdido = 0
+        self._n_blob_msgs = 0
         self._n_ir = 0
         self.ultima_accion = np.zeros((2,), dtype=np.float32)
 
@@ -292,8 +295,10 @@ class RoboboSeguimientoEnv(gym.Env):
         _blob_visible() decide, por antigüedad, si todavía es de fiar.
         """
         for blob in msg.blobs:
+            self._n_blob_msgs += 1
             if blob.color == COLOR_BLOB:
-                self._blob_x = float(blob.x)
+                self._last_blob_x = self._blob_posx 
+                self._blob_posx = float(blob.x)
                 self._dist = (-238.76 * np.log(blob.size) + 1557.47)/1000
                 self._blob_t_ultimo = time.time()
                 self._n_ir += 1
@@ -546,9 +551,9 @@ class RoboboSeguimientoEnv(gym.Env):
         (observación, acción) que recibe el algoritmo está desplazada un
         paso en el tiempo.
         """
-        objetivo = self._n_ir + 1
+        objetivo = self._n_blob_msgs + 1
         t0 = time.time()
-        while self._n_ir < objetivo:
+        while self._n_blob_msgs < objetivo:
             rclpy.spin_once(self.nodo, timeout_sec=0.05)
             if time.time() - t0 > ESPERA_MAX_S:
                 raise RuntimeError(
@@ -572,7 +577,7 @@ class RoboboSeguimientoEnv(gym.Env):
         visible = self._blob_visible()
         if visible:
             blob_x = float(np.clip(
-                (self._blob_x - BLOB_X_CENTRO) / BLOB_X_CENTRO, -1.0, 1.0))
+                (self._blob_posx - BLOB_X_CENTRO) / BLOB_X_CENTRO, -1.0, 1.0))
             dist = float(np.clip(
                 (self._dist - DIST_TARGET_M) / DIST_TARGET_M, -1.0, 1.0))
         else:
@@ -581,9 +586,10 @@ class RoboboSeguimientoEnv(gym.Env):
 
 
     def _observacion(self):
+        self._last_seen_blob_x = self._last_blob_x if self._blob_visible() else self._last_seen_blob_x
         visible, blob_x, dist = self._leer_blob()
         return np.array(
-            [blob_x, dist, 1.0 if visible else 0.0] +
+            [blob_x, dist, 1.0 if visible else 0.0, self._last_seen_blob_x] +
             list(self.ultima_accion),
             dtype=np.float32)
 
@@ -594,10 +600,11 @@ class RoboboSeguimientoEnv(gym.Env):
     def _recompensa(self, blob_x, dist, visible, accion, accion_prev,
                     perdido, choque):
         if choque:
-            return -5.0
+            return -3.0
         if perdido:
             return -2.0
-
+        if not visible:
+            return -0.25 * self.pasos_perdido
         # ---- 1) término principal: distancia + centrado ----
         e_x = abs(blob_x)
     
@@ -610,10 +617,9 @@ class RoboboSeguimientoEnv(gym.Env):
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
         if e_x <= X_TOLERANCIA and BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
             r_posicion += 0.5
-        if not visible:
-            r_posicion -= 0.75
         
-        r_posicion -= (abs(accion[1])**2)/2
+        
+        r_posicion -= abs(accion_prev[0]-accion[1])/10
         return float(r_posicion)
 
     # -----------------------------------------------------------------
@@ -644,14 +650,9 @@ class RoboboSeguimientoEnv(gym.Env):
         return self._observacion(), {}
 
     def step(self, accion):
-        if self.pasos >= 4:
-            accion_prev = self.ultima_accion
-            accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
-            self.ultima_accion = accion
-        else:
-            accion_prev = self.ultima_accion
-            accion = np.array([-0.6, 0.0], dtype=np.float32) 
-            self.ultima_accion = accion
+        accion_prev = self.ultima_accion
+        accion = np.clip(np.asarray(accion, dtype=np.float32), -1.0, 1.0)
+        self.ultima_accion = accion
             
         # 1. Reescalar la acción normalizada a unidades del SI y enviarla.
         #    El puente traduce el Twist a velocidades de rueda.
@@ -676,13 +677,12 @@ class RoboboSeguimientoEnv(gym.Env):
         else:
             self.pasos_perdido += 1
 
-        choque = visible and dist <= DIST_CHOQUE_M
+        d_m = self._dist
+        choque = visible and d_m <= DIST_CHOQUE_M
+        en_banda = visible and BANDA_OBJETIVO_M[0] <= d_m <= BANDA_OBJETIVO_M[1]
+        
+        self.en_banda = self.en_banda + 1 if en_banda else 0
         perdido = self.pasos_perdido >= PASOS_PERDIDO_MAX
-
-        en_banda_ahora = (visible
-                          and abs(BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1])
-                          and abs(blob_x) <= X_TOLERANCIA)
-        self.en_banda = self.en_banda + 1 if en_banda_ahora else 0
 
         recompensa = self._recompensa(
             blob_x, dist, visible, accion, accion_prev,
