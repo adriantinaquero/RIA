@@ -619,7 +619,8 @@ class RoboboSeguimientoEnv(gym.Env):
             r_posicion += 0.5
         
         
-        r_posicion -= abs(accion_prev[0]-accion[1])/10
+        r_posicion -= abs(accion_prev[1]-accion[1])/10
+        r_posicion -= abs(accion_prev[0]-accion[0])/5
         return float(r_posicion)
 
     # -----------------------------------------------------------------
