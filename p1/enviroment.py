@@ -27,8 +27,8 @@ import rclpy
 from rclpy.node import Node
 
 # Interfaces propias del puente para poder reiniciar la escena
-from robobo_ros2_interfaces.msg import RobotLocation    #TODO
-from robobo_ros2_interfaces.srv import ResetSimulation#, GetSimObjectLocation
+from robobo_ros2_interfaces.msg import RobotLocation    
+from robobo_ros2_interfaces.srv import ResetSimulation
 
 
 try:
@@ -709,14 +709,12 @@ class RoboboSeguimientoEnv(gym.Env):
             'perdido': perdido,
             'en_banda_consecutivos': self.en_banda,
             'pose_sim': self._pose,
-            'pose_sim_robot_objetivo': self._pose_robot_objetivo,
-            'distancia_real_mm': distancia_real,
+            'distancia_real_mm': d_m,
         }
-        self.nodo.get_logger().info(f"{recompensa}, blob: {blob_x:.3f}, {dist:.3f}, visible: {visible}, choque: {choque}, perdido: {perdido}, pasos: {self.pasos}, en_banda_consecutivos: {self.en_banda}")
         if self.verbose:
-            print('paso {:3d}  vis={}  x={:+.3f}  tam={:.3f}  '
+            print('paso {:3d}  vis={}  x={:+.3f}  dist={:.3f}  '
                   'v={:+.3f}  w={:+.3f}  r={:+.3f}{}'
-                  .format(self.pasos, int(visible), blob_x, dist,
+                  .format(self.pasos, int(visible), blob_x, d_m,
                           v, w, recompensa,
                           '  CHOQUE' if choque else
                           ('  PERDIDO' if perdido else '')))
@@ -772,10 +770,6 @@ def calibrar(avanzar=True):
         RobotLocation, NS_SIM_ROBOT_OBJETIVO + '/robot_location',
         lambda m: estado.__setitem__('pose_robot_objetivo', (m.position.x, m.position.z)), 1)
     
-    #TODO
-    # cli_get_objects = nodo.create_client(GetSimObjects, NS_SIM + '/get_objects')
-    # cli_get_location = nodo.create_client(GetSimObjectLocation, NS_SIM + '/get_object_location')
-
     cli_move_wheels = nodo.create_client(MoveWheels, NS_BASE + '/move_wheels')
     cli_stop_wheels = nodo.create_client(StopWheels, NS_BASE + '/stop_wheels')
     if not cli_move_wheels.wait_for_service(timeout_sec=5.0):
@@ -806,23 +800,6 @@ def calibrar(avanzar=True):
         futuro = cli_stop_wheels.call_async(StopWheels.Request())
         rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=1.0)
 
-    #TODO
-    # def lista_objetos_sim():
-    #     futuro = cli_get_objects.call_async(GetSimObjects.Request())
-    #     rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=5.0)
-    #     if futuro.result() is None:
-    #         raise RuntimeError('No se ha podido obtener la lista de objetos del simulador.')
-    #     return [o.name for o in futuro.result().objects]
-    
-    # def obtener_ubicacion_objeto_sim(nombre_objeto):
-    #     peticion = GetSimObjectLocation.Request()
-    #     peticion.name = nombre_objeto
-    #     futuro = cli_get_location.call_async(peticion)
-    #     rclpy.spin_until_future_complete(nodo, futuro, timeout_sec=5.0)
-    #     if futuro.result() is None:
-    #         raise RuntimeError(f'No se ha podido obtener la ubicación del objeto "{nombre_objeto}" en el simulador.')
-    #     return (futuro.result().position.x, futuro.result().position.z)
-
     def distancia_real():
         print(estado['pose'], estado['pose_robot_objetivo'])
         if estado['pose'] and estado['pose_robot_objetivo']:
@@ -836,8 +813,7 @@ def calibrar(avanzar=True):
     try:
         # Esperar 0.5s girando callbacks para recibir la detección inicial de la cámara
         spin_for_duration(0.5)
-        #TODO
-        # print(lista_objetos_sim())
+
         if not avanzar:
             print(cabecera)
             while rclpy.ok():
