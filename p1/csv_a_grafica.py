@@ -3,7 +3,10 @@ import pandas as pd
 import seaborn as sns
 
 # NOMBRE DEL CSV PARA GRAFICAR
-CSV_NAME = "logs csv/seguir_logs_SAC_CONST_1_EpLenMean.csv"
+CSV_NAME = "logs csv/seguir_logs_SAC_CONST_3_EpRewMean.csv"
+
+# CAMBIAR DEPENDIENDO DE SI la curva del csv es de EpisodeLengthMean o EpisodeRewardMean
+CSV_TYPE = "EpisodeRewMean"
 
 # estilo visual de seaborn
 sns.set_theme(style="whitegrid")
@@ -42,13 +45,25 @@ sns.lineplot(
 )
 
 # etiquetas y leyenda
-plt.title(
-    "Curva de Aprendizaje - Duración del Episodio (SAC)",
-    fontsize=14,
-    weight="bold",
-)
+if CSV_TYPE == "EpisodeLengthMean":
+    plt.title(
+        "Curva de Aprendizaje - Duración del Episodio (SAC)",
+        fontsize=14,
+        weight="bold",
+    )
+else:
+    plt.title(
+        "Curva de Aprendizaje - Recompensa del Episodio (SAC)",
+        fontsize=14,
+        weight="bold",
+    )
+
 plt.xlabel("Pasos del entorno (step())", fontsize=12)
-plt.ylabel("Duración del episodio (pasos)", fontsize=12)
+
+if CSV_TYPE == "EpisodeLengthMean":
+    plt.ylabel("Duración del episodio (pasos)", fontsize=12)
+else:
+    plt.ylabel("Recompensa media por episodio (adimensional)", fontsize=12)
 
 plt.legend(loc="upper left")
 plt.tight_layout()
