@@ -20,7 +20,7 @@ def _recompensa(self, blob_x, dist, visible, accion, accion_prev,
         r_posicion = (1.0 - e_x) * 0.4 + (1.0 - e_dist) * 0.6
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
-        if e_x <= X_TOLERANCIA and BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
+        if e_x <= X_TOLERANCIA and NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
             r_posicion += 0.5
         
         
@@ -52,7 +52,7 @@ DIST_CHOQUE_M = 0.12
 DIST_PERDIDO_M = 0.9
 DIST_TARGET_M = 0.3
 BANDA_OBJETIVO_M = [0.2, 0.45]
-
+NORM_BANDA_OBJETIVO = (BANDA_OBJETIVO_M - DIST_TARGET_M)/DIST_TARGET_M
 
 # Desviación horizontal del blob que se tolera 
 # En las mismas unidades que blob_x normalizado ([-1, 1]).
@@ -97,13 +97,13 @@ ESPERA_MAX_S = 1.0
         r_posicion = (1.0 - e_x) * 0.4 + (1.0 - e_dist) * 0.6
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
-        if e_x <= X_TOLERANCIA and BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
+        if e_x <= X_TOLERANCIA and NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
             r_posicion += 0.75
         
         
         r_posicion -= abs(accion_prev[1]-accion[1])/10
 
-        if BANDA_OBJETIVO_M[0] <= dist <= BANDA_OBJETIVO_M[1]:
+        if NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
             r_posicion -= abs(accion_prev[0]-accion[0])**2
         
         return float(r_posicion)
@@ -131,7 +131,7 @@ DIST_CHOQUE_M = 0.12
 DIST_PERDIDO_M = 0.9
 DIST_TARGET_M = 0.3
 BANDA_OBJETIVO_M = [0.2, 0.45]
-
+NORM_BANDA_OBJETIVO = (BANDA_OBJETIVO_M - DIST_TARGET_M)/DIST_TARGET_M
 
 # Desviación horizontal del blob que se tolera 
 # En las mismas unidades que blob_x normalizado ([-1, 1]).
