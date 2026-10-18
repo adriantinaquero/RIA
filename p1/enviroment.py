@@ -269,8 +269,8 @@ class RoboboSeguimientoEnv(gym.Env):
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
         # [blob_x, dist, visible, ultimo_blob_x, ultima_dist, ultima_accion_v, ultima_accion_w]
-        low=np.array([-1.0, -1.0, 0.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32),
-        high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+        low=np.array([-1.0, -1.0, 0.0, -1.0, -1.0, -1.0], dtype=np.float32),
+        high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
         dtype=np.float32)
 
         self.action_space = spaces.Box(
@@ -596,7 +596,7 @@ class RoboboSeguimientoEnv(gym.Env):
         self._last_seen_dist = self._last_dist if self._blob_visible() else self._last_seen_dist
         visible, blob_x, dist = self._leer_blob()
         return np.array(
-            [blob_x, dist, 1.0 if visible else 0.0, self._last_seen_blob_x, self._last_seen_dist] +
+            [blob_x, dist, 1.0 if visible else 0.0, self._last_seen_blob_x] +
             list(self.ultima_accion),
             dtype=np.float32)
 

@@ -42,12 +42,13 @@ Orden recomendado de ejecución:
 import argparse
 import os
 import time
+from dotenv import load_dotenv
 
 import numpy as np
 
 from enviroment import RoboboSeguimientoEnv, calibrar
 
-
+load_dotenv()
 RUTA_MODELO = os.environ['RUTA_MODELO']
 RUTA_LOGS = 'seguir_logs'
 
