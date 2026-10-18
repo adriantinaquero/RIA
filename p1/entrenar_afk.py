@@ -25,8 +25,8 @@ def train1():
 
         # Run 2
         run(train)
-        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_CONST_FAST_2")
-        rename("./seguir_modelo.zip", "./seguir_modelo_sac_const_fast_2.zip")
+        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_2")
+        rename("./seguir_modelo.zip", "./seguir_modelo_sac_var_2.zip")
     except KeyboardInterrupt:
         return
     except:
@@ -35,11 +35,11 @@ def train1():
         except:
             pass
         try:
-            os.remove( "./seguir_logs/SAC_CONST_FAST_2")
+            os.remove( "./seguir_logs/SAC_VAR_2")
         except:
             pass
         try:
-            os.remove( "./seguir_modelo_sac_const_fast_2.zip")
+            os.remove( "./seguir_modelo_sac_var_2.zip")
         except:
             pass
         train1()
@@ -48,8 +48,8 @@ def train2():
         train = [sys.executable, "entrenar_seguir.py", "--entrenar"]
         # Run 3
         run(train)
-        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_CONST_FAST_3")
-        rename("./seguir_modelo.zip", "./seguir_modelo_sac_const_fast_3.zip")
+        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_3")
+        rename("./seguir_modelo.zip", "./seguir_modelo_sac_var_3.zip")
         
     except KeyboardInterrupt:
         return
@@ -59,17 +59,41 @@ def train2():
         except:
             pass
         try:
-            os.remove( "./seguir_logs/SAC_CONST_FAST_3")
+            os.remove( "./seguir_logs/SAC_VAR_3")
         except:
             pass
         try:
-            os.remove( "./seguir_modelo_sac_const_fast_3.zip")
+            os.remove( "./seguir_modelo_sac_var_3.zip")
         except:
             pass
         train2()
 
-
+def train0():
+    try:
+        train = [sys.executable, "entrenar_seguir.py", "--entrenar"]
+        # Run 3
+        run(train)
+        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_1")
+        rename("./seguir_modelo.zip", "./seguir_modelo_sac_var_1.zip")
+        
+    except KeyboardInterrupt:
+        return
+    except:
+        try:
+            os.remove( "./seguir_logs/SAC_1")
+        except:
+            pass
+        try:
+            os.remove( "./seguir_logs/SAC_VAR_1")
+        except:
+            pass
+        try:
+            os.remove( "./seguir_modelo_sac_var_1.zip")
+        except:
+            pass
+        train2()
 if __name__ == "__main__":
+    train0()
     train1()
     train2()
     run(["git", "add", "--all"])

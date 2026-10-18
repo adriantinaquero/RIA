@@ -92,6 +92,9 @@ NS_SIM_ROBOT_OBJETIVO = '/robobo/robot_1/sim'
 # Color por el que se filtra dentro de BlobArray.msg.blobs.
 COLOR_BLOB = 'green'
 
+
+VELOCIDAD_SIM = 1
+
 # posx del blob en [0, 100], donde 50 es el centro de la imagen.
 BLOB_X_CENTRO = 50.0
 
@@ -111,7 +114,7 @@ PASOS_PERDIDO_MAX = 4
 
 # Tiempo máximo desde la última detección del blob para seguir
 # considerándolo "visible ahora mismo"
-BLOB_VIGENCIA_S = 0.4
+BLOB_VIGENCIA_S = 0.4/VELOCIDAD_SIM
 
 V_MIN = 0.02
 V_MAX = 0.15
@@ -119,7 +122,7 @@ W_MAX = 0.35
 
 PASO_S = 0.2
 
-ESPERA_MAX_S = 1.0
+ESPERA_MAX_S = 1.0/VELOCIDAD_SIM
 
 SIGMA = 0.18
 MU = 0.0
@@ -183,7 +186,9 @@ class RoboboSeguimientoEnv(gym.Env):
         self._blob_posx = None
         self._dist = None
         self._last_blob_x = None
+        self._last_dist = None
         self._last_seen_blob_x = 0.0
+        self._last_seen_dist = 0.0
         self._blob_t_ultimo = -1.0   # time.time() de la última detección
 
         self.base_ns = f'/robobo/robot_{self.robot_name}/base'
@@ -262,9 +267,9 @@ class RoboboSeguimientoEnv(gym.Env):
 
         # -------------------------------------------------- espacios
         self.observation_space = spaces.Box(
-        # [blob_x, dist, visible, ultimo_blob_x, ultima_accion_v, ultima_accion_w]
-        low=np.array([-1.0, -1.0, 0.0, -1, -1.0, -1.0], dtype=np.float32),
-        high=np.array([1.0, 1.0, 1.0, 1, 1.0, 1.0], dtype=np.float32),
+        # [blob_x, dist, visible, ultimo_blob_x, ultima_dist, ultima_accion_v, ultima_accion_w]
+        low=np.array([-1.0, -1.0, 0.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32),
+        high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
         dtype=np.float32)
 
         self.action_space = spaces.Box(
@@ -303,6 +308,7 @@ class RoboboSeguimientoEnv(gym.Env):
             if blob.color == COLOR_BLOB:
                 self._last_blob_x = self._blob_posx 
                 self._blob_posx = float(blob.x)
+                self._last_dist = self._dist
                 self._dist = (-238.76 * np.log(blob.size) + 1557.47)/1000
                 self._blob_t_ultimo = time.time()
                 self._n_ir += 1
@@ -585,9 +591,10 @@ class RoboboSeguimientoEnv(gym.Env):
 
     def _observacion(self):
         self._last_seen_blob_x = self._last_blob_x if self._blob_visible() else self._last_seen_blob_x
+        self._last_seen_dist = self._last_dist if self._blob_visible() else self._last_seen_dist
         visible, blob_x, dist = self._leer_blob()
         return np.array(
-            [blob_x, dist, 1.0 if visible else 0.0, self._last_seen_blob_x] +
+            [blob_x, dist, 1.0 if visible else 0.0, self._last_seen_blob_x, self._last_seen_dist] +
             list(self.ultima_accion),
             dtype=np.float32)
 
@@ -620,7 +627,8 @@ class RoboboSeguimientoEnv(gym.Env):
 
         if NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
             r_posicion -= abs(accion_prev[0]-accion[0])**2
-        
+        else:
+            r_posicion -= abs(dist)
         return float(r_posicion)
 
     # -----------------------------------------------------------------
