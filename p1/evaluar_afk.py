@@ -27,17 +27,15 @@ def echo_to_file(text, dst):
     print(f"\n>>> echo <text> > {dst}", flush=True)
     dst.write_text(text + "\n", encoding="utf-8")
 
-def train1():
-    train = [sys.executable, "entrenar_seguir.py", "--evaluar"]
+def evaluate():
+    ev = [sys.executable, "entrenar_seguir.py", "--evaluar"]
     for tipo in modelos:
         for i in range(3):
             echo_to_file(f"RUTA_MODELO = \"{base}{tipo}{i}\"", "./.env")
-            run(train)
-            
+            run(ev)
+
 if __name__ == "__main__":
-    # train0()
-    train1()
-    train2()
+    evaluate()
     run(["git", "add", "--all"])
     run(["git", "commit", "-m", "logs contr"])
     run(["git", "push"])
