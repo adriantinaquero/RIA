@@ -21,7 +21,7 @@ def rename(src, dst):
 
 def train1():
     try:
-        train = [sys.executable, "entrenar_seguir.py", "--entrenar"]
+        train = [sys.executable, "entrenar_seguir.py", "--entrenar", "--pasos 6000"]
 
         # Run 2
         run(train)
@@ -45,7 +45,7 @@ def train1():
         train1()
 def train2():
     try:
-        train = [sys.executable, "entrenar_seguir.py", "--entrenar"]
+        train = [sys.executable, "entrenar_seguir.py", "--entrenar",  "--pasos 6000"]
         # Run 3
         run(train)
         rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_3")
@@ -70,7 +70,7 @@ def train2():
 
 def train0():
     try:
-        train = [sys.executable, "entrenar_seguir.py", "--entrenar"]
+        train = [sys.executable, "entrenar_seguir.py", "--entrenar",  "--pasos:=6000"]
         # Run 3
         run(train)
         rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_1")

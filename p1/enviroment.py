@@ -187,6 +187,7 @@ class RoboboSeguimientoEnv(gym.Env):
         self._dist = None
         self._last_blob_x = None
         self._last_dist = None
+        self._blob_size = 0
         self._last_seen_blob_x = 0.0
         self._last_seen_dist = 0.0
         self._blob_t_ultimo = -1.0   # time.time() de la última detección
@@ -309,7 +310,8 @@ class RoboboSeguimientoEnv(gym.Env):
                 self._last_blob_x = self._blob_posx 
                 self._blob_posx = float(blob.x)
                 self._last_dist = self._dist
-                self._dist = (-238.76 * np.log(blob.size) + 1557.47)/1000
+                self._dist = (-238.76 * np.log(blob.size +1e-7) + 1557.47)/1000
+                self._blob_size = blob.size 
                 self._blob_t_ultimo = time.time()
                 self._n_ir += 1
                 break
@@ -572,7 +574,7 @@ class RoboboSeguimientoEnv(gym.Env):
     # -----------------------------------------------------------------
 
     def _blob_visible(self):
-        if self._dist == float('inf'):
+        if self._blob_size == 0:
             return False
         return (time.time() - self._blob_t_ultimo) <= BLOB_VIGENCIA_S
 
@@ -627,8 +629,7 @@ class RoboboSeguimientoEnv(gym.Env):
 
         if NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
             r_posicion -= abs(accion_prev[0]-accion[0])**2
-        else:
-            r_posicion -= abs(dist)
+        
         return float(r_posicion)
 
     # -----------------------------------------------------------------

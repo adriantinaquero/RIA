@@ -48,7 +48,7 @@ import numpy as np
 from enviroment import RoboboSeguimientoEnv, calibrar
 
 
-RUTA_MODELO = 'seguir_modelo_sac_const_fast_2'
+RUTA_MODELO = 'seguir_modelo'
 RUTA_LOGS = 'seguir_logs'
 
 
