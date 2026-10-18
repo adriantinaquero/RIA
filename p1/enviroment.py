@@ -560,13 +560,7 @@ class RoboboSeguimientoEnv(gym.Env):
         while self._n_blob_msgs < objetivo:
             rclpy.spin_once(self.nodo, timeout_sec=0.05)
             if time.time() - t0 > ESPERA_MAX_S:
-                raise RuntimeError(
-                    'No llegan lecturas de {}/color_blobs.\n'
-                    'Comprobar que robobo_container está en ejecución y '
-                    'conectado al simulador.'.format(NS_BASE)
-                    if inicial else
-                    'Se ha interrumpido el flujo de lecturas de los '
-                    'blobs durante el episodio.')
+                return "error"
     # -----------------------------------------------------------------
     # Observación
     # -----------------------------------------------------------------
@@ -611,12 +605,11 @@ class RoboboSeguimientoEnv(gym.Env):
             return -0.25 * self.pasos_perdido
         # ---- 1) término principal: distancia + centrado ----
         e_x = abs(blob_x)
-    
-        # Error de distancia respecto al objetivo
-        e_dist = abs(dist)
 
+        # Error de distancia respecto al objetivo
+        reward_e_dist = np.exp(-((dist - MU) ** 2) / (2 * SIGMA ** 2)) / (SIGMA * np.sqrt(2 * np.pi))
         # Recompensa continua en el rango (0, 1] cuando está bien posicionado
-        r_posicion = (1.0 - e_x) * 0.4 + (1.0 - e_dist) * 0.6
+        r_posicion = (1.0 - e_x) * 0.4 + reward_e_dist * 0.6
 
         # Bonus adicional si se encuentra dentro de la tolerancia deseada
         if e_x <= X_TOLERANCIA and NORM_BANDA_OBJETIVO[0] <= dist <= NORM_BANDA_OBJETIVO[1]:
@@ -674,7 +667,10 @@ class RoboboSeguimientoEnv(gym.Env):
         time.sleep(PASO_S)
 
         self._vaciar_cola()
-        self._esperar_lectura_nueva()
+        error = self._esperar_lectura_nueva()
+        if error:
+            self.reset()
+            return
 
         self.pasos += 1
 
