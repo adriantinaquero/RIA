@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 base = "seguir_modelo_sac_"
-modelos = ["const_", "const_fast_", "var_", "contr_"]
+modelos = ["var_"]
 
 def run(cmd):
     """Run a command, wait for it to finish, and stop the script if it fails."""
@@ -28,10 +28,10 @@ def echo_to_file(text, dst):
     dst.write_text(text + "\n", encoding="utf-8")
 
 def evaluate():
-    ev = [sys.executable, "entrenar_seguir.py", "--evaluar"]
+    ev = [sys.executable, "entrenar_seguir.py", "--evaluar", "--pasos", "600", "--episodios", "2"]
     for tipo in modelos:
-        for i in range(3):
-            echo_to_file(f"RUTA_MODELO = \"{base}{tipo}{i}\"", "./.env")
+        for i in range(1, 3):
+            echo_to_file(f"RUTA_MODELO = \"{base}{tipo}{i+1}\"", "./.env")
             run(ev)
 
 if __name__ == "__main__":
