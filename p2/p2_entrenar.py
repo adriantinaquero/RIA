@@ -7,36 +7,38 @@ from stable_baselines3 import SAC
 import argparse
 
 
-def modo_entrenar(ruta_modelo, ruta_config, prefijo, archivo_final)
+def modo_entrenar(args):
     os.makedirs("chk", exist_ok=True) # el Checkpointer no crea carpetas
     config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
                         neat.DefaultSpeciesSet, neat.DefaultStagnation,
-                        ruta_config)
+                        args.ruta_config)
 
     poblacion = neat.Population(config)
     poblacion.add_reporter(neat.StdOutReporter(True))
     estadisticas = neat.StatisticsReporter()
     poblacion.add_reporter(estadisticas)
     poblacion.add_reporter(neat.Checkpointer(generation_interval=1,
-                                            filename_prefix=f"chk/{prefijo}-"))
-    poblacion.add_reporter(RegistroGeneracion(archivo_final, "genomas"))
+                                            filename_prefix=f"chk/{args.prefijo}-"))
+    poblacion.add_reporter(RegistroGeneracion(args.archivo_final, "genomas"))
 
     mejor = poblacion.run(eval_genomes, 30) # 30 generaciones
-    with open(ruta_modelo, "wb") as f:
+    with open(args.ruta_modelo, "wb") as f:
         pickle.dump(mejor, f)
 
 # --------- Reanudar entrenamiento ---------
-def reanudar_entrenamiento(ruta_modelo, prefijo, checkpoint, pasos_faltantes, archivo_final)
-    poblacion = neat.Checkpointer.restore_checkpoint(f"chk/{prefijo}-{checkpoint}")
+def reanudar_entrenamiento(args):
+    poblacion = neat.Checkpointer.restore_checkpoint(f"chk/{args.prefijo}-{args.checkpoint}")
     # los registros no se recuperan: se vuelven a añadir, igual que al empezar
     poblacion.add_reporter(neat.StdOutReporter(True))
     poblacion.add_reporter(neat.Checkpointer(generation_interval=1,
-                                            filename_prefix=f"chk/{prefijo}-"))
-    poblacion.add_reporter(RegistroGeneracion(archivo_final, "genomas"))
-    mejor = poblacion.run(eval_genomes, pasos_faltantes) # las generaciones que faltan
+                                            filename_prefix=f"chk/{args.prefijo}-"))
+    poblacion.add_reporter(RegistroGeneracion(args.archivo_final, "genomas"))
+    mejor = poblacion.run(eval_genomes, args.pasos_faltantes) # las generaciones que faltan
+    with open(args.ruta_modelo, "wb") as f:
+        pickle.dump(mejor, f)
 
 # --------- Evaluar red final ---------
-def modo_evaluar(ruta_genoma, ruta_config, ruta_modelo):
+def modo_evaluar(args):
     def controlador_neat(ruta_genoma, ruta_config):
         config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
                             neat.DefaultSpeciesSet, neat.DefaultStagnation,
@@ -50,7 +52,7 @@ def modo_evaluar(ruta_genoma, ruta_config, ruta_modelo):
         modelo = SAC.load(ruta_modelo) # o PPO.load
         return lambda obs: modelo.predict(obs, deterministic=True)[0]
 
-    red = controlador_neat("mejor_genoma.pkl", "config-p2.ini")
+    red = controlador_neat(args.ruta_genoma, args.ruta_config)
     # evaluar_anexo_b(env, red, configuracion="C2") # el evaluador de la P1
 
 def main():

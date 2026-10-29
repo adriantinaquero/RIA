@@ -1,8 +1,8 @@
 import numpy as np
 import neat
-from p1.enviroment import SeguidorEnv # el entorno de la Práctica 1
+from p1_environment import RoboboSeguimientoEnv # el entorno de la Práctica 1
 
-env = SeguidorEnv() # un único entorno y un único nodo
+env = RoboboSeguimientoEnv() # un único entorno y un único nodo
 PASOS_EVAL = 150 # 30 s con pasos de 0,2 s
 CONTADOR = {"pasos": 0, "evaluaciones": 0}
 
