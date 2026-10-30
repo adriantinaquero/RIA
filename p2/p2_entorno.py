@@ -5,6 +5,7 @@ from p1_environment import RoboboSeguimientoEnv # el entorno de la Práctica 1
 env = RoboboSeguimientoEnv() # un único entorno y un único nodo
 PASOS_EVAL = 150 # 30 s con pasos de 0,2 s
 CONTADOR = {"pasos": 0, "evaluaciones": 0}
+N_ITERACIONES = 3
 
 def evaluar_genoma(genoma, config):
     red = neat.nn.FeedForwardNetwork.create(genoma, config)
@@ -21,8 +22,16 @@ def evaluar_genoma(genoma, config):
     return calidad(registro) # la define cada grupo (apartado 4)
 
 def eval_genomes(genomas, config):
+    pos = 1
     for _, genoma in genomas:
-        genoma.fitness = evaluar_genoma(genoma, config)
+        print(f"Individuo {pos}:")
+        scores = []
+        for _ in range(N_ITERACIONES):
+            scores.append(evaluar_genoma(genoma, config))
+        scores = np.array(scores)
+        genoma.fitness = float(scores.mean() - 0.5 * scores.std())
+        print(f"Fitness = {genoma.fitness}")
+        pos += 1
 
 
 # info = {
@@ -36,8 +45,9 @@ def eval_genomes(genomas, config):
 #     'distancia_real_mm': d_m,
 # }
 
-SIGMA = 0.18
-MU = 0.0
+SIGMA_CERCA = 0.20
+SIGMA_LEJOS = 0.40
+SIGMA_X     = 0.35
 BLOB_X_CENTRO = 50.0
 
 DIST_CHOQUE_M = 0.12
@@ -48,31 +58,45 @@ NORM_BANDA_OBJETIVO = (BANDA_OBJETIVO_M - DIST_TARGET_M)/DIST_TARGET_M
 
 X_TOLERANCIA = 0.15
 
-def calidad(registro:list[dict]) -> float:
-    calidad_total = 0
+def _r_dist(info):
+    # unclipped normalised error from ground truth, for the fitness only
+    d_real = info['distancia_real_mm'] / 1000.0
+    d = (d_real - DIST_TARGET_M) / DIST_TARGET_M      # can exceed +1
+    s = SIGMA_CERCA if d < 0 else SIGMA_LEJOS
+    return np.exp(-0.5 * (d / s) ** 2)
+
+def calidad(registro: list[dict]) -> float:
+    total = 0.0
+    n = len(registro)
+
     for info in registro:
-        if info['choque']:
-            calidad_total += -3.0
-            continue
-        if info['perdido']:
-            calidad_total += -2.0
-            continue
+        if info['choque'] or info['perdido']:
+            # terminal failure: charge for every step that was not played
+            restantes = PASOS_EVAL - n
+            total -= 1.0 * (restantes + 1)
+            if info['choque']:
+                total -= 2.0                       # extra for crashing vs. losing
+            break
+
         if not info['visible']:
-            calidad_total += -0.25
+            # use ground truth (not available to the net) to grade failures
+            d_real = info['distancia_real_mm'] / 1000.0
+            err = min(1.0, abs(d_real - DIST_TARGET_M) / DIST_TARGET_M)
+            total += -0.2 - 0.3 * err              # in [-0.5, -0.2]
             continue
-        # ---- 1) término principal: distancia + centrado ----
-        e_x = abs(info['blob_x'])
 
-        # Error de distancia respecto al objetivo
-        reward_e_dist = np.exp(-((info['dist'] - MU) ** 2) / (2 * SIGMA ** 2)) / (SIGMA * np.sqrt(2 * np.pi))
-        reward_e_dist = (reward_e_dist - 0.5)*2
-        # Recompensa continua en el rango (0, 1] cuando está bien posicionado
-        r_posicion = (1.0 - e_x) * 0.4 + reward_e_dist * 0.6
+        e_x  = abs(info['blob_x'])
+        r_d  = _r_dist(info)
+        r_x  = np.exp(-0.5 * (e_x / SIGMA_X) ** 2)
 
-        # Bonus adicional si se encuentra dentro de la tolerancia deseada
+        # distance gates centering; both in (0, 1]
+        r = r_d * (0.4 + 0.6 * r_x)
+
+        # smooth "in the sweet spot" bonus, grows with sustained tracking
         if e_x <= X_TOLERANCIA and NORM_BANDA_OBJETIVO[0] <= info['dist'] <= NORM_BANDA_OBJETIVO[1]:
-            r_posicion += 0.75
+            racha = min(info['en_banda_consecutivos'], 50) / 50
+            r += 0.3 * (0.5 + 0.5 * racha)
 
-        calidad_total += r_posicion
-            
-    return calidad_total/PASOS_EVAL
+        total += r
+
+    return total / PASOS_EVAL
