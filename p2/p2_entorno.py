@@ -65,6 +65,7 @@ def calidad(registro:list[dict]) -> float:
 
         # Error de distancia respecto al objetivo
         reward_e_dist = np.exp(-((info['dist'] - MU) ** 2) / (2 * SIGMA ** 2)) / (SIGMA * np.sqrt(2 * np.pi))
+        reward_e_dist = (reward_e_dist - 0.5)*2
         # Recompensa continua en el rango (0, 1] cuando está bien posicionado
         r_posicion = (1.0 - e_x) * 0.4 + reward_e_dist * 0.6
 
