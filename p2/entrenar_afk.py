@@ -3,6 +3,7 @@ import sys
 import os
 from pathlib import Path
 
+GENERACIONES = 50
 
 def run(cmd):
     """Run a command, wait for it to finish, and stop the script if it fails."""
@@ -19,84 +20,29 @@ def rename(src, dst):
         sys.exit(f"ERROR: {dst} already exists")
     src.rename(dst)
 
-def train1():
-    try:
-        train = [sys.executable, "entrenar_seguir.py", "--entrenar", "--pasos", "3000"]
+def train():
+    train_cmd = [sys.executable, "p2_entrenar.py", "--entrenar", "--generaciones", "1"]
+    run(train_cmd)
 
-        # Run 2
-        run(train)
-        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_2")
-        rename("./seguir_modelo.zip", "./seguir_modelo_sac_var_2.zip")
-    except KeyboardInterrupt:
-        return
-    except:
-        try:
-            os.remove( "./seguir_logs/SAC_1")
-        except:
-            pass
-        try:
-            os.remove( "./seguir_logs/SAC_VAR_2")
-        except:
-            pass
-        try:
-            os.remove( "./seguir_modelo_sac_var_2.zip")
-        except:
-            pass
-        train1()
-def train2():
+    reanudar_entrenamiento()
+
+def reanudar_entrenamiento(i = 1):
+    temp_i = i
     try:
-        train = [sys.executable, "entrenar_seguir.py", "--entrenar",  "--pasos", "3000"]
-        # Run 3
-        run(train)
-        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_3")
-        rename("./seguir_modelo.zip", "./seguir_modelo_sac_var_3.zip")
+        for j in range(i, GENERACIONES):
+            train_cmd = [sys.executable, "p2_entrenar.py", "--reanudar-entrenamiento",
+                        "--pasos-faltantes", "1", "--checkpoint", str(j)]
+            run(train_cmd)
+            temp_i = j
         
     except KeyboardInterrupt:
         return
     except:
-        try:
-            os.remove( "./seguir_logs/SAC_1")
-        except:
-            pass
-        try:
-            os.remove( "./seguir_logs/SAC_VAR_3")
-        except:
-            pass
-        try:
-            os.remove( "./seguir_modelo_sac_var_3.zip")
-        except:
-            pass
-        train2()
+        reanudar_entrenamiento(temp_i)
 
-def train0():
-    try:
-        train = [sys.executable, "entrenar_seguir.py", "--entrenar",  "--pasos", "6000"]
-        # Run 3
-        run(train)
-        rename("./seguir_logs/SAC_1", "./seguir_logs/SAC_VAR_1")
-        rename("./seguir_modelo.zip", "./seguir_modelo_sac_var_1.zip")
-        
-    except KeyboardInterrupt:
-        return
-    except:
-        try:
-            os.remove( "./seguir_logs/SAC_1")
-        except:
-            pass
-        try:
-            os.remove( "./seguir_logs/SAC_VAR_1")
-        except:
-            pass
-        try:
-            os.remove( "./seguir_modelo_sac_var_1.zip")
-        except:
-            pass
-        train2()
 if __name__ == "__main__":
-    # train0()
-    train1()
-    train2()
-    run(["git", "add", "--all"])
-    run(["git", "commit", "-m", "logs contr"])
-    run(["git", "push"])
+    train()
+    # run(["git", "add", "--all"])
+    # run(["git", "commit", "-m", "logs contr"])
+    # run(["git", "push"])
     print("\nAll done.")
