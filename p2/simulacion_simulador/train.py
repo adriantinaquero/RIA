@@ -2,7 +2,7 @@
 train.py - parallel NEAT training / evaluation / viewing for the follower robot.
 
 Modes (same names as p2_entrenar.py, plus a few extras for the simulator):
-    python train.py --entrenar --ruta-config config.txt --generaciones 100 --dt 0.2 --pasos-max 150
+    python train.py --entrenar --ruta-config config.txt --generaciones 100 --pasos-max 800
     python train.py --reanudar-entrenamiento --checkpoint 40 --pasos-faltantes 60
     python train.py --evaluar --ruta-modelo mejor_genoma.plk --episodios 5 --camino roja --perfil stop_go
     python train.py --ver --ruta-modelo mejor_genoma.plk          (pygame window)
@@ -23,46 +23,72 @@ import random
 import neat
 import numpy as np
 
-from follow_sim import (DEV_SOFT_M, DEV_TOL_M, DIST_TARGET_M, NORM_BANDA_OBJETIVO, X_TOLERANCIA,
-                        FollowEnv, p_controller, watch)
+from follow_sim import (DIST_TARGET_M, LANE_HALF_M, NORM_BANDA_OBJETIVO, X_TOLERANCIA,
+                        PASO_S, PATH, FollowEnv, p_controller, watch)
 from registro import RegistroGeneracion
 
-SCENARIOS = [("verde", "const"), ("roja", "const"), ("verde", "stop_go"),
-             ("roja", "sine"), ("verde", "sine"), ("roja", "stop_go")]
+# Preferred CAMERA distance (camera -> ball) for the REWARD, normalised: (d - 0.3)/0.3. A pursuing robot cuts the
+# corners by an amount that grows with the square of its distance to the leader, and the lane is only 62 mm
+# from the centre line. Following at 0.30 m uses all of that margin; at ~0.21 m it cuts far less. -0.30 -> 0.21 m,
+# still inside the target band (0.20-0.45 m).
+D_PREF = -0.30
+SIGMA_CERCA, SIGMA_LEJOS, SIGMA_X = 0.25, 0.30, 0.20
+W_DESVIO = 1.5        # penalty weight for the (normalised, squared) distance to the lane centre line
+W_BORDE = 4.0         # extra penalty slope once past 80 % of the lane half width
+W_SUAVE_W = 2.0       # quadratic penalty on the change of the steering command (anti-wobble)
+W_SUAVE_W1 = 0.3      # linear penalty on the change of the steering command
+W_SUAVE_V = 0.5       # quadratic penalty on the change of the speed command
+W_RUMBO = 0.3         # penalty for heading away from the lane direction (0.5 rad -> full penalty). 0 disables it
 
-SIGMA_CERCA, SIGMA_LEJOS, SIGMA_X = 0.20, 0.50, 0.35
-W_DESVIO = 0.8        # max per-step penalty for straying from the chosen path
+
+def _err_rumbo(info):
+    """Heading of the follower minus the direction of the nearest lane segment (rad, ground truth)."""
+    x, y, th = info["pose_sim"]
+    ap = np.array([x, y]) - PATH._a
+    t = np.clip((ap * PATH._ab).sum(axis=1) / PATH._ab2, 0.0, 1.0)
+    d = ap - PATH._ab * t[:, None]
+    i = int(np.argmin((d ** 2).sum(axis=1)))
+    e = th - np.arctan2(PATH._ab[i, 1], PATH._ab[i, 0])
+    return float((e + np.pi) % (2 * np.pi) - np.pi)
 
 
 # --------------------------------------------------------------------------- #
 # Fitness
 # --------------------------------------------------------------------------- #
 def _r_dist(info):
-    d_real = info["distancia_real_mm"] / 1000.0
-    d = (d_real - DIST_TARGET_M) / DIST_TARGET_M          # unclipped, from ground truth
+    d_real = info["dist_camara_mm"] / 1000.0                  # camera -> ball, the quantity the real env measures
+    d = (d_real - DIST_TARGET_M) / DIST_TARGET_M - D_PREF   # unclipped, from ground truth, centred on D_PREF
     s = SIGMA_CERCA if d < 0 else SIGMA_LEJOS
     return float(np.exp(-0.5 * (d / s) ** 2))
 
-
-def penal_desvio(info):
-    """0 inside the band around the path (DEV_TOL_M), growing quadratically to W_DESVIO at DEV_SOFT_M."""
-    x = (info["desvio_m"] - DEV_TOL_M) / (DEV_SOFT_M - DEV_TOL_M)
-    return W_DESVIO * min(1.0, max(0.0, x)) ** 2
-
-
 def r_paso(info):
     """Reward of one non-terminal step."""
+    e_c = info["desvio_m"] / LANE_HALF_M                   # 0 = on the centre line, 1 = at the lane edge
+    r_cam = -W_DESVIO * min(e_c, 1.5) ** 2 - W_BORDE * max(0.0, e_c - 0.8)
+    if W_RUMBO > 0:
+        r_cam -= W_RUMBO * min(1.0, (_err_rumbo(info) / 0.5) ** 2)
+    d_a1 = abs(info["prev_action"][1] - info["action"][1])
+    d_a0 = abs(info["prev_action"][0] - info["action"][0])
+    r_suave = -min(1.0, W_SUAVE_W * d_a1 ** 2 + W_SUAVE_W1 * d_a1 + W_SUAVE_V * d_a0 ** 2)   # capped: never swamps the rest
+
     if not info["visible"]:
-        d_real = info["distancia_real_mm"] / 1000.0
+        d_real = info["dist_camara_mm"] / 1000.0
         err = min(1.0, abs(d_real - DIST_TARGET_M) / DIST_TARGET_M)
-        return -0.2 - 0.3 * err - penal_desvio(info)
+        return -0.2 - 0.3 * err + r_cam + r_suave
 
     e_x = abs(info["blob_x"])
-    r = _r_dist(info) * (0.4 + 0.6 * float(np.exp(-0.5 * (e_x / SIGMA_X) ** 2)))
+    r = _r_dist(info) * (0.3 + 0.7 * float(np.exp(-0.5 * (e_x / SIGMA_X) ** 2)))
     if e_x <= X_TOLERANCIA and NORM_BANDA_OBJETIVO[0] <= info["dist"] <= NORM_BANDA_OBJETIVO[1]:
         racha = min(info["en_banda_consecutivos"], 50) / 50.0
         r += 0.3 * (0.5 + 0.5 * racha)
-    return r - penal_desvio(info)
+    
+    if info["fuera_camino"]:
+        r -= 0.5
+
+    if info["desvio_m"] <= 0.04:
+        r += 0.5
+
+    return r + r_cam + r_suave
 
 
 def calidad(registro, pasos_eval):
@@ -71,8 +97,6 @@ def calidad(registro, pasos_eval):
         if info["choque"] or info["perdido"] or info["fuera_camino"]:
             total -= 1.0 * (pasos_eval - n + 1)            # charge the steps never played
             if info["choque"]:
-                total -= 3.0
-            elif info["fuera_camino"]:
                 total -= 2.0
             break
         total += r_paso(info)
@@ -106,9 +130,9 @@ def desenlace(st):
     return "tiempo agotado"
 
 
-def run_episode(politica, env, seed, detalle=False):
+def run_episode(politica, env, seed, detalle=False, s0=None):
     """politica: obs -> action (or None for random actions). Returns the list of info dicts."""
-    obs = env.reset(seed)
+    obs = env.reset(seed, s0)
     registro = []
     while True:
         accion = np.random.uniform(-1, 1, 2) if politica is None else politica(obs)
@@ -127,14 +151,15 @@ def run_episode(politica, env, seed, detalle=False):
             return registro
 
 
-def evaluate(genome, config, gen_seed, dt, n_iter, pasos_max):
-    """mean - 0.5*std over several scenarios; same seeds for every genome in a generation.
+def evaluate(genome, config, gen_seed, dt, n_iter, pasos_max, aleat=True):
+    """0.6*mean + 0.4*worst over several scenarios; same seeds for every genome in a generation.
     Returns (fitness, stats) where stats summarises the behaviour over the episodes."""
     net = neat.nn.FeedForwardNetwork.create(genome, config)
     scores, sts = [], []
     for i in range(n_iter):
-        path, profile = SCENARIOS[(gen_seed + i) % len(SCENARIOS)]
-        env = FollowEnv(dt=dt, max_time=pasos_max * dt, path=path, profile=profile)
+        # ALWAYS the original start position. Episodes are long enough (pasos_max) for the leader to go
+        # round the whole lap, so every episode contains all four corners.
+        env = FollowEnv(dt=dt, max_time=pasos_max * dt, aleatorizar=aleat)
         reg = run_episode(net.activate, env, gen_seed * 1000 + i)
         scores.append(calidad(reg, env.max_steps))
         sts.append(stats_episodio(reg))
@@ -148,37 +173,39 @@ def evaluate(genome, config, gen_seed, dt, n_iter, pasos_max):
         "perdidos": sum(st["perdido"] for st in sts),
         "fuera": sum(st["fuera"] for st in sts),
     }
-    return float(s.mean() - 0.5 * s.std()), stats
+    # the worst scenario (usually the one with a corner) weighs a lot: a net that only survives the
+    # straights must not out-rank one that also takes the curves
+    return float(0.6 * s.mean() + 0.4 * s.min()), stats
 
 
 def _job(args):
     return evaluate(*args)
 
 
-def validate(genome, config, dt, pasos_max, seeds=(10_001, 10_002)):
-    """Fixed, larger test set (every scenario x several seeds) to pick the real best genome."""
+def validate(genome, config, dt, pasos_max, seeds=(10_001, 10_002, 10_003, 10_004, 10_005, 10_006)):
+    """Fixed test set, same for every candidate: the original start, half of the episodes on the nominal
+    simulator and half with domain randomisation (the candidate must work on both)."""
     net = neat.nn.FeedForwardNetwork.create(genome, config)
     scores = []
-    for sd in seeds:
-        for j, (path, profile) in enumerate(SCENARIOS):
-            env = FollowEnv(dt=dt, max_time=pasos_max * dt, path=path, profile=profile)
-            scores.append(calidad(run_episode(net.activate, env, sd * 100 + j), env.max_steps))
+    for k, sd in enumerate(seeds):
+        env = FollowEnv(dt=dt, max_time=pasos_max * dt, aleatorizar=(k % 2 == 1))
+        scores.append(calidad(run_episode(net.activate, env, sd * 100), env.max_steps))
     s = np.asarray(scores)
-    return float(s.mean() - 0.5 * s.std())
+    return float(0.6 * s.mean() + 0.4 * s.min())
 
 
 # --------------------------------------------------------------------------- #
 # Parallel evaluator (a Pool so we can pass a per-generation seed to the workers)
 # --------------------------------------------------------------------------- #
 class PoolEvaluator:
-    def __init__(self, workers, dt, n_iter, pasos_max, detalle=False):
+    def __init__(self, workers, dt, n_iter, pasos_max, detalle=False, aleat=True):
         self.pool = mp.Pool(workers)
-        self.dt, self.n_iter, self.pasos_max, self.detalle = dt, n_iter, pasos_max, detalle
+        self.dt, self.n_iter, self.pasos_max, self.detalle, self.aleat = dt, n_iter, pasos_max, detalle, aleat
         self.contador = {"pasos": 0, "evaluaciones": 0}
 
     def __call__(self, genomas, config):
         gen_seed = random.randrange(1_000_000)
-        jobs = [(g, config, gen_seed, self.dt, self.n_iter, self.pasos_max) for _, g in genomas]
+        jobs = [(g, config, gen_seed, self.dt, self.n_iter, self.pasos_max, self.aleat) for _, g in genomas]
         resultados = self.pool.map(_job, jobs, chunksize=1)
         pasos = 0
         for pos, ((_, g), (fit, st)) in enumerate(zip(genomas, resultados), 1):
@@ -247,7 +274,8 @@ def _ejecutar(poblacion, config, args, n_generaciones):
                                              filename_prefix=f"chk/{args.prefijo}-"))
     poblacion.add_reporter(RegistroGeneracion(args.archivo_final, "genomas"))
 
-    ev = PoolEvaluator(args.workers, args.dt, args.iteraciones, args.pasos_max, args.detalle)
+    ev = PoolEvaluator(args.workers, args.dt, args.iteraciones, args.pasos_max, args.detalle,
+                       aleat=not args.sin_aleatorizar)
     try:
         poblacion.run(ev, n_generaciones)
     except KeyboardInterrupt:
@@ -292,7 +320,7 @@ def _cargar_red(args):
 
 def _crear_env(args):
     return FollowEnv(dt=args.dt, max_time=args.pasos_max * args.dt,
-                     path=args.camino, profile=args.perfil)
+                     aleatorizar=getattr(args, 'aleatorizar_eval', False))
 
 
 def modo_evaluar(args):
@@ -303,7 +331,7 @@ def modo_evaluar(args):
 
 def modo_ver(args):
     red = _cargar_red(args)
-    watch(red.activate, dt=args.dt, path=args.camino, profile=args.perfil, seed=args.seed,
+    watch(red.activate, dt=args.dt, seed=args.seed,
           speed=args.velocidad, max_time=args.pasos_max * args.dt,
           track_img=args.imagen_pista, robot_img=args.imagen_robot)
 
@@ -321,14 +349,18 @@ def main():
     modo.add_argument("--reanudar-entrenamiento", action="store_true")
     modo.add_argument("--ver", action="store_true", help="ventana pygame con el genoma guardado")
 
-    p.add_argument("--dt", type=float, default=0.2, help="periodo de control (s), cualquier valor")
-    p.add_argument("--pasos-max", type=int, default=150, help="longitud máxima de un episodio (pasos)")
-    p.add_argument("--iteraciones", type=int, default=3, help="episodios por genoma y generación")
+    p.add_argument("--dt", type=float, default=PASO_S, help="periodo de control (s); por defecto PASO_S de follow_sim.py")
+    p.add_argument("--pasos-max", type=int, default=800,
+                   help="longitud máxima de un episodio (pasos). 800 pasos x 0.29 s a 0.04 m/s = una vuelta completa")
+    p.add_argument("--iteraciones", type=int, default=5, help="episodios por genoma y generación")
     p.add_argument("--episodios", type=int, default=5, help="episodios en --evaluar/--comprobar/--aleatorio")
     p.add_argument("--workers", type=int, default=os.cpu_count())
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--detalle", action="store_true",
                    help="una línea por individuo (entrenar) o por paso (evaluar/comprobar)")
+    p.add_argument("--sin-aleatorizar", action="store_true",
+                   help="entrenar solo con el simulador nominal (sin aleatorizar planta/sensor)")
+    p.add_argument("--aleatorizar-eval", action="store_true", help="evaluar/ver con el simulador aleatorizado")
     p.add_argument("--camino", default="verde", choices=["verde", "roja"], help="camino del líder (evaluar/ver)")
     p.add_argument("--perfil", default="const", choices=["const", "stop_go", "sine"])
     p.add_argument("--velocidad", type=float, default=1.0, help="velocidad de reproducción en --ver")

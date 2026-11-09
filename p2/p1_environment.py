@@ -114,9 +114,12 @@ PASOS_PERDIDO_MAX = 4
 # considerándolo "visible ahora mismo"
 BLOB_VIGENCIA_S = 0.4
 
-V_MIN = 0.02
+V_MIN = 0.0
 V_MAX = 0.15
 W_MAX = 0.35
+# El simulador de entrenamiento (follow_sim.py) asume que w > 0 gira a la IZQUIERDA (convención ROS).
+# Si en RoboboSim w > 0 gira a la derecha, poner -1.0 aquí (o W_SIGN = -1.0 en follow_sim.py y reentrenar).
+W_SIGN = 1.0
 
 PASO_S = 0.2
 
@@ -590,13 +593,20 @@ class RoboboSeguimientoEnv(gym.Env):
 
 
     def _observacion(self):
-        self._last_seen_blob_x = self._last_blob_x if self._blob_visible() else self._last_seen_blob_x
-        self._last_seen_dist = self._last_dist if self._blob_visible() else self._last_seen_dist
         visible, blob_x, dist = self._leer_blob()
-        return np.array(
+        if visible:
+            # Última lectura vista, YA NORMALIZADA como blob_x y dist ([-1, 1]).
+            # Antes se guardaba self._last_blob_x / self._last_dist, que son la lectura
+            # ANTERIOR sin normalizar (posx en [0, 100] y distancia en metros, y None en la
+            # primera detección): la red entrenada en el simulador recibía entradas 3 y 4
+            # con otra escala que en el entrenamiento.
+            self._last_seen_blob_x = blob_x
+            self._last_seen_dist = dist
+        obs = np.array(
             [blob_x, dist, 1.0 if visible else 0.0, self._last_seen_blob_x, self._last_seen_dist] +
             list(self.ultima_accion),
             dtype=np.float32)
+        return np.nan_to_num(obs, nan=0.0)
 
     # -----------------------------------------------------------------
     # Recompensa
@@ -649,6 +659,8 @@ class RoboboSeguimientoEnv(gym.Env):
         self.pasos_perdido = 0
         self._phi_prev = None
         self.ultima_accion = np.zeros((2,), dtype=np.float32)
+        self._last_seen_blob_x = 0.0      # no arrastrar la última lectura del episodio anterior
+        self._last_seen_dist = 0.0
 
         # Se limpia la última detección para no arrastrar una lectura de antes del
         # reinicio, y se confía en _blob_visible() para el resto.
@@ -665,7 +677,7 @@ class RoboboSeguimientoEnv(gym.Env):
         # 1. Reescalar la acción normalizada a unidades del SI y enviarla.
         #    El puente traduce el Twist a velocidades de rueda.
         v = V_MIN + (accion[0] + 1.0) * 0.5 * (V_MAX - V_MIN)
-        w = float(accion[1]) * W_MAX
+        w = W_SIGN * float(accion[1]) * W_MAX
         self._publicar_velocidad(v, w)
 
         # Como el topic de blobs es por eventos hace falta seguir haciendo

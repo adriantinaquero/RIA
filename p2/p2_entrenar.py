@@ -157,7 +157,7 @@ def main():
                    help='con --calibrar, no mueve al seguidor')
     p.add_argument('--detalle', action='store_true',
                    help='imprime una línea por paso')
-    p.add_argument('--ruta-modelo', type=str, default='mejor_genoma.plk',
+    p.add_argument('--ruta-modelo', type=str, default='mejor_genoma.pkl',
                     help='Archivo .pkl donde se guarda el mejore genoma')
     p.add_argument('--ruta-config', type=str, default='config.txt',
                     help='Archivo donde esta guardada la configuración del sistema')
