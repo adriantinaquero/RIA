@@ -50,23 +50,52 @@ HALF_FOV = math.radians(35.0)
 CAM_RANGE_M = 1.2
 BLOB_NOISE = 0.02       # std of blob_x, normalised units (centroid jitter)
 # --------------------------------------------------------------------------- #
-# Camera + ball model. The leader carries a green ball at its REAR; the follower sees it through a pinhole
-# camera and, like the real env, works out blob_x from the ball's column and the distance from its SIZE.
-#   image column  u = W/2 - f * tan(bearing)          f = (W/2) / tan(HALF_FOV)
-#   ball diameter D_px = 2 * f * tan(asin(R / rho))    (rho = camera -> ball distance)
-#   distance estimate  rho_est = K_CAL * 2 * f * R / D_px
-# Everything below is an ASSUMPTION about the real hardware: change it to your ball / camera.
+# Camera + ball model, CALIBRATED ON THE OFFICIAL SIMULATOR (datos.txt: blob size at known positions).
+#
+# What the official simulator reports as the blob "size" is an AREA in pixels of a very small image of the ball
+# (about 13 px across at 0.30 m), and it only takes discrete values (7, 14, 22, 43, 57, 72, 90, 109, 131, ...):
+#       radius_px = BLOB_C_MM_PX / distance_mm                     (area ~ 1/d^2: pinhole)
+#       area      = pi * r_q^2   with   r_q = BLOB_STEP_PX * n + BLOB_OFFS_PX,  n = 3, 4, 5, ... (integer)
+# so one quantum is ~8 % of the distance at 0.30 m (25 mm), plus a flicker of about one quantum that lasts
+# 1-3 frames. The conversion the controller uses to get a distance from the area is size_to_dist_m() below:
+# USE THE SAME FUNCTION WHEN YOU DEPLOY (in the official-simulator client).
 # --------------------------------------------------------------------------- #
-IMG_W_PX = 640                  # camera image width (pixels)
-BALL_RADIUS_M = 0.03            # radius of the leader's ball (6 cm diameter)
-BALL_BACK_M = 0.05              # the ball's centre sits this far BEHIND the leader's centre (on its heading axis)
-CAM_FWD_M = 0.0                 # camera position ahead of the follower's centre
-BLOB_FORMA = "esfera"           # "esfera": silhouette independent of the viewing angle.
-                                # "disco": flat disc on the leader's back: it narrows with cos(viewing angle)
-MIN_BLOB_PX = 8.0               # blobs narrower than this (after clipping at the image border) are not detected
-DIAM_NOISE_PX = 1.5             # std of the measured blob width (segmentation jitter), pixels
-K_CAL = 1.0                     # calibration factor of the size->distance conversion (1.0 = perfectly calibrated)
+IMG_W_PX = 160                  # camera image width (ASSUMED; it only matters for the ball cut by the image border)
+BLOB_C_MM_PX = 1975.0           # fitted on datos.txt (bootstrap 5-95 %: 1820-2130). Distance = centre-to-centre.
+BLOB_STEP_PX = 0.555            # radius quantum of the reported area (fitted: levels 7,14,22,43,57,72,90,109,131)
+BLOB_OFFS_PX = -0.20
+BLOB_N_MIN = 3                  # smallest detectable blob: n = 3  (area 7 px)
+RADIUS_NOISE_PX = 0.25          # frame-to-frame jitter of the blob radius (px) -> the one-level flicker in the data
+RADIUS_NOISE_AR = 0.5           # ... and how much of it carries over to the next frame (flicker lasts 1-3 frames)
+BALL_BACK_M = 0.0               # ball centre behind the leader's centre. 0: the data's reference points ARE the
+                                # calibration reference; set > 0 only if you re-fit BLOB_C_MM_PX accordingly
+CAM_FWD_M = 0.0                 # camera ahead of the follower's centre (same remark)
+BLOB_FORMA = "esfera"           # "esfera": silhouette independent of viewing angle; "disco": flat disc on the
+                                # leader's back whose area shrinks with cos(viewing angle)
+BLOB_AREA_MAX = None            # if set (e.g. 133): the reported area saturates there (hypothesis: the official
+                                # simulator stops growing the blob when the leader is closer than ~0.3 m)
+K_CAL = 1.0                     # calibration factor of the size->distance conversion (1.0 = same as the data)
 F_PX = (IMG_W_PX / 2.0) / math.tan(HALF_FOV)
+BALL_RADIUS_M = BLOB_C_MM_PX / F_PX / 1000.0    # physical radius implied by the calibration (only for drawing)
+
+
+def size_to_dist_m(area_px, k_cal=1.0):
+    """Distance (m) the controller infers from the blob area (pixels) reported by the camera."""
+    return k_cal * BLOB_C_MM_PX / math.sqrt(max(area_px, 1.0) / math.pi) / 1000.0
+
+
+def _frac_inside(u, r, w):
+    """Fraction of a disc (centre column u, radius r) that lies inside the image columns [0, w]."""
+    def out(e):          # area of the disc beyond a vertical line at signed distance e from its centre
+        if e >= r:
+            return 0.0
+        if e <= -r:
+            return math.pi * r * r
+        return r * r * math.acos(e / r) - e * math.sqrt(max(r * r - e * e, 0.0))
+    a = math.pi * r * r
+    return max(0.0, (a - out(u) - out(w - u)) / a)
+
+
 BLOB_VIGENCIA_S = 0.4   # a detection still counts as "visible" (stale values) for this long
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +133,17 @@ def _rango(x, nombre):
         raise ValueError(f"{nombre}: need 0 <= min <= max, got ({lo}, {hi})")
     return (lo, hi)
 
+# Leader driving modes (--modo N in train.py). Speeds in m/s; (min, max) = drawn per episode.
+modos = {
+    1: {"v_recta": (0.04, 0.04), "v_curva": (0.04, 0.04), "p_parada": 0.0, "t_parada": (1.0, 2.5), "parada_cada_s": 4.0, "aceleracion": 0.1},
+    2: {"v_recta": (0.04, 0.04), "v_curva": (0.16, 0.16), "p_parada": 0.0, "t_parada": (1.0, 2.5), "parada_cada_s": 4.0, "aceleracion": 0.1},
+    3: {"v_recta": (0.04, 0.16), "v_curva": (0.04, 0.16), "p_parada": 0.0, "t_parada": (1.0, 2.5), "parada_cada_s": 4.0, "aceleracion": 0.1},
+    4: {"v_recta": (0.1, 0.1), "v_curva": (0.1, 0.1), "p_parada": 0.2, "t_parada": (1.0, 2.5), "parada_cada_s": 4.0, "aceleracion": 0.1},
+    # 5: slow leader that often stops for a long time: the follower must brake, stay put without steering around
+    #    in place, and set off again smoothly
+    5: {"v_recta": (0.04, 0.10), "v_curva": (0.04, 0.10), "p_parada": 0.5, "t_parada": (4.0, 12.0), "parada_cada_s": 6.0, "aceleracion": 0.1},
+}
+
 
 @dataclass
 class LeaderConfig:
@@ -116,13 +156,21 @@ class LeaderConfig:
     t_parada       how long it stays stopped, in seconds (number or (min, max))
     parada_cada_s  seconds between stop checks (a check is skipped while it is already stopped)
     aceleracion    m/s^2 limit on how fast the leader changes speed (0 = instantaneous changes)
+
+    Use LeaderConfig.desde_modo(n) to get one of the presets in `modos`.
     """
-    v_recta: tuple = (0.04,0.04)
-    v_curva: tuple = (0.04,0.04)
+    v_recta: tuple = (0.04, 0.04)
+    v_curva: tuple = (0.04, 0.04)
     p_parada: float = 0.
     t_parada: tuple = (1.0, 2.5)
     parada_cada_s: float = 4.0
     aceleracion: float = 0.1
+
+    @classmethod
+    def desde_modo(cls, modo):
+        if modo not in modos:       # an unknown mode used to fall back silently to the defaults (= mode 1)
+            raise ValueError(f"unknown leader mode {modo!r}; available: {sorted(modos)}")
+        return cls(**modos[modo])
 
     def __post_init__(self):
         self.v_recta = _rango(self.v_recta, "v_recta")
@@ -247,12 +295,13 @@ class FollowEnv:
     leader: LeaderConfig (speeds, stops). margen_carril_m: extra tolerance added to the lane half width.
     """
 
-    def __init__(self, dt=PASO_S, max_time=30.0, leader=None, margen_carril_m=0.0, aleatorizar=False):
+    def __init__(self, dt=PASO_S, max_time=30.0, leader=None, margen_carril_m=0.0, aleatorizar=False, modo=1, p_saturacion=0.0):
+        self.p_saturacion = float(p_saturacion)   # with randomisation: probability that the blob area saturates in an episode
         self.aleatorizar = bool(aleatorizar)     # domain randomisation of the plant/sensor (training robustness)
         self.dt = float(dt)
         self.max_time = float(max_time)
         self.max_steps = max(1, int(round(max_time / dt)))
-        self.cfg = leader if leader is not None else LeaderConfig()
+        self.cfg = leader if leader is not None else LeaderConfig.desde_modo(modo)
         self.lane_half_m = LANE_HALF_M + float(margen_carril_m)
         self.path = PATH
         self.prev_action = (0.0, 0.0)
@@ -277,7 +326,9 @@ class FollowEnv:
         self.v_max, self.w_max, self.w_bias = V_MAX, W_MAX, 0.0
         self.motor_tau, self.blob_noise, = MOTOR_TAU, BLOB_NOISE
         self.sensor_delay, self.p_drop, self.dt_jitter = 0, 0.0, 0.0
-        self.diam_noise_px, self.k_cal = DIAM_NOISE_PX, K_CAL
+        self.r_noise_px, self.k_cal, self.quant_offs = RADIUS_NOISE_PX, K_CAL, BLOB_OFFS_PX
+        self.area_max = BLOB_AREA_MAX
+        self._r_err = 0.0
         self.sway_a, self.sway_w, self.sway_ph = 0.0, 1.0, 0.0     # leader's lateral weaving (m, rad/s, rad)
         if self.aleatorizar:
             rp = self.rng_planta
@@ -292,8 +343,11 @@ class FollowEnv:
             self.sensor_delay = int(rp.integers(0, 2))    # camera latency of 0 or 1 control steps
             self.p_drop = rp.uniform(0.0, 0.06)           # random missed detections
             self.dt_jitter = 0.08                         # control period varies +-8 % from step to step
-            self.diam_noise_px = rp.uniform(0.5, 4.0)     # blob-size measurement jitter
-            self.k_cal = rp.uniform(0.93, 1.07)           # size->distance calibration error
+            self.r_noise_px = rp.uniform(0.12, 0.45)      # blob-size jitter (the data suggests ~0.25 px)
+            self.k_cal = rp.uniform(0.88, 1.12)           # size->distance calibration error (fit uncertainty is ~8 %)
+            self.quant_offs = BLOB_OFFS_PX + rp.uniform(-0.15, 0.15)
+            # some episodes (p_saturacion): the reported blob area stops growing at some value (the recording suggests ~133)
+            self.area_max = rp.uniform(125.0, 200.0) if rp.random() < self.p_saturacion else None
             self.sway_a = rp.uniform(0.0, 0.012)          # the leader does not follow the line perfectly
             self.sway_w = 2 * math.pi / rp.uniform(4.0, 10.0)
             self.sway_ph = rp.uniform(0.0, 2 * math.pi)
@@ -333,6 +387,7 @@ class FollowEnv:
         self.dt_k = self.dt
         self.t_det = -1e9                      # time of the last camera detection
         self.bx_det = self.dm_det = 0.0        # its (noisy) blob_x and camera distance in metres
+        self._d_prev = None
         self.t = 0.0
         self.k = 0
         self.info = {}
@@ -407,50 +462,56 @@ class FollowEnv:
 
     @staticmethod
     def project_ball(cx, cy, cth, bx, by, lth):
-        """Pinhole view of the ball from a camera at (cx, cy) heading cth.
-        Returns (rho, u_center_px, diam_px_visible, u_visible_center_px) with the blob clipped at the image
-        border, or None if the ball is behind the camera."""
+        """View of the ball from a camera at (cx, cy) heading cth.
+        Returns (rho, u_px, r_eff_px, u_visible_px): distance, image column of the centre, equivalent radius of the
+        part of the blob that is inside the image, and the column of the visible part's centre. None if not seen."""
         dx, dy = bx - cx, by - cy
         rho = math.hypot(dx, dy)
-        if rho <= BALL_RADIUS_M * 1.05:
+        if rho < 0.05:
             return None
         bearing = _wrap(math.atan2(dy, dx) - cth)
         if abs(bearing) >= math.radians(85.0):
             return None
         u = IMG_W_PX / 2.0 - F_PX * math.tan(bearing)
-        r_px = F_PX * math.tan(math.asin(BALL_RADIUS_M / rho))
+        r = BLOB_C_MM_PX / (rho * 1000.0)                       # ideal radius in pixels
+        frac = _frac_inside(u, r, float(IMG_W_PX))
         if BLOB_FORMA == "disco":                               # flat disc, normal pointing backwards from the leader
             ang = _wrap(math.atan2(-dy, -dx) - (lth + math.pi)) # angle between the disc normal and the line of sight
-            r_px *= max(0.05, abs(math.cos(ang)))
-        lo, hi = max(0.0, u - r_px), min(float(IMG_W_PX), u + r_px)
-        if hi <= lo:
+            frac *= max(0.05, abs(math.cos(ang)))
+        if frac <= 0.0:
             return None
-        return rho, u, hi - lo, 0.5 * (lo + hi)
+        lo, hi = max(0.0, u - r), min(float(IMG_W_PX), u + r)
+        return rho, u, r * math.sqrt(frac), 0.5 * (lo + hi)
 
     def _observe(self, primero=False):
         lx, ly, _ = self.leader_pose()
         bx_w, by_w, lth = self.ball_pose()
         d = math.hypot(lx - self.x, ly - self.y)               # ground truth centre-to-centre (collisions)
+        cierre = 0.0 if self._d_prev is None else (self._d_prev - d) / max(self.dt_k, 1e-6)   # closing speed (m/s)
+        self._d_prev = d
         cam_x = self.x + CAM_FWD_M * math.cos(self.th)
         cam_y = self.y + CAM_FWD_M * math.sin(self.th)
         rho_true = math.hypot(bx_w - cam_x, by_w - cam_y)      # ground truth camera -> ball distance
         self._hist.append((cam_x, cam_y, self.th, bx_w, by_w, lth))
         hx, hy, hth, hbx, hby, hlth = self._hist[0]            # what the camera saw (older if it has latency)
 
-        # camera: the blob is detected when enough of the ball (>= MIN_BLOB_PX wide) is inside the image
+        # camera: what the official simulator reports is a blob AREA that only takes discrete values
         proj = self.project_ball(hx, hy, hth, hbx, hby, hlth)
-        self.diam_px = 0.0
-        if (proj is not None and proj[0] <= CAM_RANGE_M and proj[2] >= MIN_BLOB_PX
-                and not (self.p_drop > 0 and self.rng_planta.random() < self.p_drop)):
-            rho, u_c, w_vis, u_vis = proj
-            # measured blob: its visible centroid column and its width, with segmentation jitter, in whole pixels
-            u_meas = round(u_vis + self.rng.normal(0.0, self.blob_noise * IMG_W_PX / 2.0))
-            w_meas = max(1, round(w_vis + self.rng.normal(0.0, self.diam_noise_px)))
-            self.diam_px = float(w_meas)
-            self.bx_det = min(1.0, max(-1.0, (u_meas - IMG_W_PX / 2.0) / (IMG_W_PX / 2.0)))
-            # distance from the blob SIZE (a ball cut by the image border looks smaller -> looks farther)
-            self.dm_det = self.k_cal * 2.0 * F_PX * BALL_RADIUS_M / w_meas
-            self.t_det = self.t
+        self.blob_area = 0.0
+        if proj is not None and proj[0] <= CAM_RANGE_M:
+            # the radius jitter is drawn every frame so that its correlation in time does not depend on dropouts
+            self._r_err = RADIUS_NOISE_AR * self._r_err + self.rng.normal(0.0, self.r_noise_px * math.sqrt(1 - RADIUS_NOISE_AR ** 2))
+            rho, u_c, r_eff, u_vis = proj
+            n = round((r_eff + self._r_err - self.quant_offs) / BLOB_STEP_PX)
+            if n >= BLOB_N_MIN and not (self.p_drop > 0 and self.rng_planta.random() < self.p_drop):
+                area = round(math.pi * (BLOB_STEP_PX * n + self.quant_offs) ** 2)
+                if self.area_max is not None:
+                    area = min(area, self.area_max)
+                self.blob_area = float(area)
+                u_meas = round(u_vis + self.rng.normal(0.0, self.blob_noise * IMG_W_PX / 2.0))
+                self.bx_det = min(1.0, max(-1.0, (u_meas - IMG_W_PX / 2.0) / (IMG_W_PX / 2.0)))
+                self.dm_det = size_to_dist_m(area, self.k_cal)      # <- the controller's distance, from the size
+                self.t_det = self.t
         # ...and stays "visible" (with stale values) for BLOB_VIGENCIA_S, like the real env
         visible = (self.t - self.t_det) <= BLOB_VIGENCIA_S + 1e-9
 
@@ -489,8 +550,11 @@ class FollowEnv:
             "distancia_real_mm": d * 1000.0,          # centre-to-centre
             "dist_camara_mm": rho_true * 1000.0,      # camera -> ball (what the size-based estimate tries to measure)
             "dist_estimada_mm": self.dm_det * 1000.0 if visible else 0.0,
-            "blob_diam_px": self.diam_px if visible else 0.0,
+            "blob_area_px": self.blob_area if visible else 0.0,
+            "blob_diam_px": 2.0 * math.sqrt(self.blob_area / math.pi) if visible else 0.0,
             "v_lider": self.v_lider,
+            "v_seguidor": self.v,
+            "cierre_m_s": cierre,
             "lider_parado": self.t < self.parado_hasta,
         }
         obs = [bx, dn, 1.0 if visible else 0.0, self.last_x, self.last_d,
@@ -588,10 +652,10 @@ class Viewer:
         self._draw_camera_view(info)
         pg.display.flip()
 
-    def _draw_camera_view(self, info, scale=0.3):
+    def _draw_camera_view(self, info, scale=1.2):
         """Inset with what the follower's camera sees: the blob, at its column and with its pixel size."""
         pg = self.pg
-        w, h = int(IMG_W_PX * scale), int(480 * scale)
+        w, h = int(IMG_W_PX * scale), int(IMG_W_PX * 0.75 * scale)
         x0, y0 = 4, WORLD_H_PX - h - 4
         pg.draw.rect(self.screen, (235, 235, 235), (x0, y0, w, h))
         if info["visible"] and info["blob_diam_px"] > 0:
@@ -605,10 +669,11 @@ class Viewer:
 
 
 def watch(policy, dt=PASO_S, leader=None, margen_carril_m=0.0, seed=0, speed=1.0, max_time=60.0,
-          track_img=None, robot_img=None):
+          track_img=None, robot_img=None, modo=1, aleatorizar=False):
     """Real-time view. Keys: SPACE pause, R reset, UP/DOWN speed, ESC quit."""
     import pygame
-    env = FollowEnv(dt=dt, max_time=max_time, leader=leader, margen_carril_m=margen_carril_m)
+    env = FollowEnv(dt=dt, max_time=max_time, leader=leader, margen_carril_m=margen_carril_m,
+                    modo=modo, aleatorizar=aleatorizar)
     viewer = Viewer(track_img, robot_img)
     clock = pygame.time.Clock()
     obs = env.reset(seed)

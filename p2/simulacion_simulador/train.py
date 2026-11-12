@@ -23,7 +23,7 @@ import random
 import neat
 import numpy as np
 
-from follow_sim import (DIST_TARGET_M, LANE_HALF_M, NORM_BANDA_OBJETIVO, X_TOLERANCIA,
+from follow_sim import (modos, DIST_TARGET_M, LANE_HALF_M, NORM_BANDA_OBJETIVO, X_TOLERANCIA,
                         PASO_S, PATH, FollowEnv, p_controller, watch)
 from registro import RegistroGeneracion
 
@@ -31,13 +31,17 @@ from registro import RegistroGeneracion
 # corners by an amount that grows with the square of its distance to the leader, and the lane is only 62 mm
 # from the centre line. Following at 0.30 m uses all of that margin; at ~0.21 m it cuts far less. -0.30 -> 0.21 m,
 # still inside the target band (0.20-0.45 m).
-D_PREF = -0.30
-SIGMA_CERCA, SIGMA_LEJOS, SIGMA_X = 0.25, 0.30, 0.20
+D_PREF = -0.10   # 0.27 m: a little inside the task's 0.30 m target (corners are cut less). If your sensor saturates
+                 # (see --saturacion) the net cannot see closer than ~0.30 m: then use 0.0 (0.30 m)
+SIGMA_CERCA, SIGMA_LEJOS, SIGMA_X = 0.20, 0.30, 0.20     # closer than preferred is punished harder than farther
 W_DESVIO = 1.5        # penalty weight for the (normalised, squared) distance to the lane centre line
 W_BORDE = 4.0         # extra penalty slope once past 80 % of the lane half width
 W_SUAVE_W = 2.0       # quadratic penalty on the change of the steering command (anti-wobble)
 W_SUAVE_W1 = 0.3      # linear penalty on the change of the steering command
 W_SUAVE_V = 0.5       # quadratic penalty on the change of the speed command
+W_CIERRE = 1.0        # penalty for closing in on the leader faster than ~2 cm/s (steady pace, no rushing)
+W_GIRO_PARADO = 0.6   # penalty for steering while (almost) stopped with the leader already centred (no dithering)
+W_ZIGZAG = 0.8        # penalty for flipping the steering sign from one step to the next
 W_RUMBO = 0.3         # penalty for heading away from the lane direction (0.5 rad -> full penalty). 0 disables it
 
 
@@ -70,11 +74,19 @@ def r_paso(info):
     d_a1 = abs(info["prev_action"][1] - info["action"][1])
     d_a0 = abs(info["prev_action"][0] - info["action"][0])
     r_suave = -min(1.0, W_SUAVE_W * d_a1 ** 2 + W_SUAVE_W1 * d_a1 + W_SUAVE_V * d_a0 ** 2)   # capped: never swamps the rest
+    a1, p1 = info["action"][1], info["prev_action"][1]
+    # steady behaviour: do not rush towards the leader, do not turn on the spot, do not zig-zag
+    if info["distancia_real_mm"] < 450.0:
+        r_suave -= W_CIERRE * min(1.0, max(0.0, (info["cierre_m_s"] - 0.02) / 0.06) ** 2)
+    if info["v_seguidor"] < 0.03 and abs(info["blob_x"]) < 0.2:
+        r_suave -= W_GIRO_PARADO * min(1.0, abs(a1))
+    if a1 * p1 < 0:
+        r_suave -= W_ZIGZAG * min(1.0, min(abs(a1), abs(p1)) / 0.3)
 
     if not info["visible"]:
         d_real = info["dist_camara_mm"] / 1000.0
         err = min(1.0, abs(d_real - DIST_TARGET_M) / DIST_TARGET_M)
-        return -0.2 - 0.3 * err + r_cam + r_suave
+        return -1.0 - 0.3 * err + r_cam + r_suave
 
     e_x = abs(info["blob_x"])
     r = _r_dist(info) * (0.3 + 0.7 * float(np.exp(-0.5 * (e_x / SIGMA_X) ** 2)))
@@ -83,7 +95,7 @@ def r_paso(info):
         r += 0.3 * (0.5 + 0.5 * racha)
     
     if info["fuera_camino"]:
-        r -= 0.5
+        r -= 1
 
     if info["desvio_m"] <= 0.04:
         r += 0.5
@@ -151,7 +163,12 @@ def run_episode(politica, env, seed, detalle=False, s0=None):
             return registro
 
 
-def evaluate(genome, config, gen_seed, dt, n_iter, pasos_max, aleat=True):
+def _modo_ep(modo, i):
+    """`modo` is an int or a tuple of ints; episode i uses modo[i % len(modo)]."""
+    return modo if isinstance(modo, int) else modo[i % len(modo)]
+
+
+def evaluate(genome, config, gen_seed, dt, n_iter, pasos_max, modo, aleat=True, p_sat=0.0):
     """0.6*mean + 0.4*worst over several scenarios; same seeds for every genome in a generation.
     Returns (fitness, stats) where stats summarises the behaviour over the episodes."""
     net = neat.nn.FeedForwardNetwork.create(genome, config)
@@ -159,7 +176,7 @@ def evaluate(genome, config, gen_seed, dt, n_iter, pasos_max, aleat=True):
     for i in range(n_iter):
         # ALWAYS the original start position. Episodes are long enough (pasos_max) for the leader to go
         # round the whole lap, so every episode contains all four corners.
-        env = FollowEnv(dt=dt, max_time=pasos_max * dt, aleatorizar=aleat)
+        env = FollowEnv(dt=dt, max_time=pasos_max * dt, aleatorizar=aleat, modo=_modo_ep(modo, i), p_saturacion=p_sat)
         reg = run_episode(net.activate, env, gen_seed * 1000 + i)
         scores.append(calidad(reg, env.max_steps))
         sts.append(stats_episodio(reg))
@@ -182,13 +199,13 @@ def _job(args):
     return evaluate(*args)
 
 
-def validate(genome, config, dt, pasos_max, seeds=(10_001, 10_002, 10_003, 10_004, 10_005, 10_006)):
+def validate(genome, config, dt, pasos_max, modo=1, p_sat=0.0, seeds=(10_001, 10_002, 10_003, 10_004, 10_005, 10_006)):
     """Fixed test set, same for every candidate: the original start, half of the episodes on the nominal
     simulator and half with domain randomisation (the candidate must work on both)."""
     net = neat.nn.FeedForwardNetwork.create(genome, config)
     scores = []
     for k, sd in enumerate(seeds):
-        env = FollowEnv(dt=dt, max_time=pasos_max * dt, aleatorizar=(k % 2 == 1))
+        env = FollowEnv(dt=dt, max_time=pasos_max * dt, aleatorizar=(k % 2 == 1), modo=_modo_ep(modo, k), p_saturacion=p_sat)
         scores.append(calidad(run_episode(net.activate, env, sd * 100), env.max_steps))
     s = np.asarray(scores)
     return float(0.6 * s.mean() + 0.4 * s.min())
@@ -198,14 +215,15 @@ def validate(genome, config, dt, pasos_max, seeds=(10_001, 10_002, 10_003, 10_00
 # Parallel evaluator (a Pool so we can pass a per-generation seed to the workers)
 # --------------------------------------------------------------------------- #
 class PoolEvaluator:
-    def __init__(self, workers, dt, n_iter, pasos_max, detalle=False, aleat=True):
+    def __init__(self, workers, dt, n_iter, pasos_max, modo, detalle=False, aleat=True, p_sat=0.0):
         self.pool = mp.Pool(workers)
-        self.dt, self.n_iter, self.pasos_max, self.detalle, self.aleat = dt, n_iter, pasos_max, detalle, aleat
+        self.dt, self.n_iter, self.pasos_max, self.modo, self.detalle, self.aleat = dt, n_iter, pasos_max, modo, detalle, aleat
+        self.p_sat = p_sat
         self.contador = {"pasos": 0, "evaluaciones": 0}
 
     def __call__(self, genomas, config):
         gen_seed = random.randrange(1_000_000)
-        jobs = [(g, config, gen_seed, self.dt, self.n_iter, self.pasos_max, self.aleat) for _, g in genomas]
+        jobs = [(g, config, gen_seed, self.dt, self.n_iter, self.pasos_max, self.modo, self.aleat, self.p_sat) for _, g in genomas]
         resultados = self.pool.map(_job, jobs, chunksize=1)
         pasos = 0
         for pos, ((_, g), (fit, st)) in enumerate(zip(genomas, resultados), 1):
@@ -274,8 +292,8 @@ def _ejecutar(poblacion, config, args, n_generaciones):
                                              filename_prefix=f"chk/{args.prefijo}-"))
     poblacion.add_reporter(RegistroGeneracion(args.archivo_final, "genomas"))
 
-    ev = PoolEvaluator(args.workers, args.dt, args.iteraciones, args.pasos_max, args.detalle,
-                       aleat=not args.sin_aleatorizar)
+    ev = PoolEvaluator(args.workers, args.dt, args.iteraciones, args.pasos_max, args.modo,
+                       detalle=args.detalle, aleat=not args.sin_aleatorizar, p_sat=args.saturacion)
     try:
         poblacion.run(ev, n_generaciones)
     except KeyboardInterrupt:
@@ -287,7 +305,7 @@ def _ejecutar(poblacion, config, args, n_generaciones):
     if not candidatos:
         print("no hay genomas que guardar")
         return
-    puntuados = [(validate(g, config, args.dt, args.pasos_max), g) for g in candidatos]
+    puntuados = [(validate(g, config, args.dt, args.pasos_max, args.modo, args.saturacion), g) for g in candidatos]
     for sc, g in sorted(puntuados, key=lambda t: -t[0]):
         print(f"candidato id={g.key}  entrenamiento={g.fitness:.3f}  validación={sc:.3f}")
     mejor_sc, mejor = max(puntuados, key=lambda t: t[0])
@@ -318,22 +336,25 @@ def _cargar_red(args):
     return neat.nn.FeedForwardNetwork.create(genoma, config)
 
 
-def _crear_env(args):
+def _crear_env(args, modo=None):
     return FollowEnv(dt=args.dt, max_time=args.pasos_max * args.dt,
-                     aleatorizar=getattr(args, 'aleatorizar_eval', False))
+                     aleatorizar=getattr(args, 'aleatorizar_eval', False),
+                     modo=args.modo[0] if modo is None else modo)
 
 
 def modo_evaluar(args):
     red = _cargar_red(args)
-    resumen(_crear_env(args), red.activate, args.episodios,
-            f"NEAT ({args.ruta_modelo}) - {args.perfil}/{args.camino}", args.detalle)
+    for m in args.modo:                                   # one summary per leader mode
+        resumen(_crear_env(args, m), red.activate, args.episodios,
+                f"NEAT ({args.ruta_modelo}) - modo {m}", args.detalle)
 
 
 def modo_ver(args):
     red = _cargar_red(args)
     watch(red.activate, dt=args.dt, seed=args.seed,
           speed=args.velocidad, max_time=args.pasos_max * args.dt,
-          track_img=args.imagen_pista, robot_img=args.imagen_robot)
+          track_img=args.imagen_pista, robot_img=args.imagen_robot,
+          modo=args.modo[0], aleatorizar=getattr(args, 'aleatorizar_eval', False))
 
 
 def main():
@@ -358,6 +379,9 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--detalle", action="store_true",
                    help="una línea por individuo (entrenar) o por paso (evaluar/comprobar)")
+    p.add_argument("--saturacion", type=float, default=0.0,
+                   help="probabilidad (0-1) de que en un episodio el área del blob se sature (~133 px) al acercarse; "
+                        "0 = nunca. Úsalo solo si el simulador oficial satura el tamaño del blob de cerca")
     p.add_argument("--sin-aleatorizar", action="store_true",
                    help="entrenar solo con el simulador nominal (sin aleatorizar planta/sensor)")
     p.add_argument("--aleatorizar-eval", action="store_true", help="evaluar/ver con el simulador aleatorizado")
@@ -374,8 +398,21 @@ def main():
     p.add_argument("--checkpoint", type=int, help="generación del checkpoint desde el que reanudar")
     p.add_argument("--pasos-faltantes", type=int, help="generaciones adicionales al reanudar")
     p.add_argument("--generaciones", type=int, default=30)
+    p.add_argument("--modo", default="1",
+                   help="modo del líder (ver `modos` en follow_sim.py): 1 const 0.04 m/s, 2 curvas rápidas, 3 velocidad "
+                        "aleatoria, 4 con paradas. Varios separados por comas (p. ej. 1,2,3,4): entrenar alterna un modo "
+                        "por episodio, --evaluar da un resumen por modo, --ver usa el primero")
 
     args = p.parse_args()
+    try:
+        args.modo = tuple(int(m) for m in str(args.modo).split(","))
+    except ValueError:
+        p.error("--modo: enteros separados por comas")
+    for m in args.modo:
+        if m not in modos:
+            p.error(f"--modo {m}: no existe; disponibles: {sorted(modos)}")
+    if args.perfil != "const" or args.camino != "verde":
+        print("AVISO: --perfil y --camino no hacen nada (el líder se configura con --modo; el camino es el de follow_sim.py)")
     random.seed(args.seed)
     np.random.seed(args.seed)
 
