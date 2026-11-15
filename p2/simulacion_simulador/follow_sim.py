@@ -101,9 +101,9 @@ BLOB_VIGENCIA_S = 0.4   # a detection still counts as "visible" (stale values) f
 # --------------------------------------------------------------------------- #
 # Task constants (same meaning as in your fitness function)
 # --------------------------------------------------------------------------- #
-DIST_CHOQUE_M = 0.12
-DIST_TARGET_M = 0.3
-BANDA_OBJETIVO_M = (0.2, 0.45)
+DIST_CHOQUE_M = 0.3
+DIST_TARGET_M = 0.4
+BANDA_OBJETIVO_M = (0.3, 0.55)
 NORM_BANDA_OBJETIVO = tuple((b - DIST_TARGET_M) / DIST_TARGET_M for b in BANDA_OBJETIVO_M)
 X_TOLERANCIA = 0.15
 PASO_S = 0.29                                 # measured step period of the real env (probar_robot.py: 0.275-0.313 s)
@@ -141,7 +141,7 @@ modos = {
     4: {"v_recta": (0.1, 0.1), "v_curva": (0.1, 0.1), "p_parada": 0.2, "t_parada": (1.0, 2.5), "parada_cada_s": 4.0, "aceleracion": 0.1},
     # 5: slow leader that often stops for a long time: the follower must brake, stay put without steering around
     #    in place, and set off again smoothly
-    5: {"v_recta": (0.04, 0.10), "v_curva": (0.04, 0.10), "p_parada": 0.5, "t_parada": (4.0, 12.0), "parada_cada_s": 6.0, "aceleracion": 0.1},
+    5: {"v_recta": (0.04, 0.10), "v_curva": (0.04, 0.10), "p_parada": 0.5, "t_parada": (4.0, 12.0), "parada_cada_s": 6.0, "aceleracion": 0},
 }
 
 
@@ -185,17 +185,6 @@ class LeaderConfig:
             raise ValueError("parada_cada_s must be >= 0.1 s when p_parada > 0")
         if self.aceleracion < 0:
             raise ValueError("aceleracion must be >= 0")
-
-    def advertencias(self):
-        """Things that make the task impossible or degenerate (printed once by the caller)."""
-        out = []
-        vmax = max(self.v_recta[1], self.v_curva[1])
-        if vmax > 0.95 * V_MAX:
-            out.append(f"the leader can reach {vmax:.3f} m/s but the follower tops out at {V_MAX:.3f} m/s: "
-                       "it will lose the leader")
-        if self.v_recta[1] == 0 and self.v_curva[1] == 0:
-            out.append("the leader never moves")
-        return out
 
     def resumen(self):
         f = lambda r: f"{r[0]:.3f}" if r[0] == r[1] else f"{r[0]:.3f}-{r[1]:.3f}"

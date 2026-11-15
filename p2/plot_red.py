@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import neat 
 
 def dibujar_red(genoma, config, nombres_entrada, nombres_salida, ruta):
     gc = config.genome_config
@@ -32,3 +33,26 @@ def dibujar_red(genoma, config, nombres_entrada, nombres_salida, ruta):
         ax.text(x, y + 0.25, nombres.get(n, str(n)), ha="center", fontsize=8)
     ax.axis("off")
     fig.savefig(ruta, dpi=200, bbox_inches="tight")
+
+
+if __name__ == "__main__":
+    import argparse
+    import pickle
+
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--genoma", type=str)
+    p.add_argument("--config", type=str)
+    p.add_argument("--ruta", type=str)
+
+    args = p.parse_args()
+    
+    config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                                neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                                args.config)
+    with open(args.genoma, "rb") as f:
+                genoma = pickle.load(f)
+    dibujar_red(genoma, config,
+                ["blob_x", "dist", "visible", "ultimo_blob_x", "ultima_dist", "ultima_accion_v", "ultima_accion_w"],
+                ["v", "w"],
+                args.ruta)

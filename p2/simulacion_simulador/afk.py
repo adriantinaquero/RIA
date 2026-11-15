@@ -2,6 +2,7 @@ import subprocess
 import sys
 import os
 from pathlib import Path
+import random
 
 GENERACIONES = 50
 
@@ -23,11 +24,12 @@ def rename(src, dst):
 def train():
     for i in [1,2,3,4]:
         for j in range(3):
-            train_cmd = [sys.executable, "train.py", "--entrenar", "--ruta-config",
-                        "config.txt", "--generaciones", "200", "--pasos-max", "150",
-                        "--imagen-pista", "track.png", "--imagen-robot", "robobo.png",
-                        "--dt", "0.3", "--modo", str(i), "--ruta-modelo", f"mejor_genoma_c{i}_{j}.plk",
-                        "--prefijo", f"C{i}_{j}", "--archivo-final", f"evolucion_c{i}_{j}.csv"]
+            train_cmd = [sys.executable, "simulacion_simulador/train.py", "--entrenar", "--ruta-config",
+                        "simulacion_simulador/config.txt", "--generaciones", "200", "--pasos-max", "150",
+                        "--seed", str(random.randint(0,100000)),
+                        "--imagen-pista", "simulacion_simulador/track.png", "--imagen-robot", "simulacion_simulador/robobo.png",
+                        "--dt", "0.3", "--modo", str(i), "--ruta-modelo", f"simulacion_simulador/mejor_genoma_c{i}_{j}.pkl",
+                        "--prefijo", f"C{i}_{j}", "--archivo-final", f"simulacion_simulador/evolucion_c{i}_{j}.csv"]
             run(train_cmd)
 
 if __name__ == "__main__":

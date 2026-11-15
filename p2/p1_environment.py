@@ -115,7 +115,7 @@ PASOS_PERDIDO_MAX = 4
 BLOB_VIGENCIA_S = 0.4
 
 V_MIN = 0.0
-V_MAX = 0.1
+V_MAX = 0.12
 W_MAX = 0.3
 # El simulador de entrenamiento (follow_sim.py) asume que w > 0 gira a la IZQUIERDA (convención ROS).
 # Si en RoboboSim w > 0 gira a la derecha, poner -1.0 aquí (o W_SIGN = -1.0 en follow_sim.py y reentrenar).
