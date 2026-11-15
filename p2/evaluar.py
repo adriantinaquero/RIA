@@ -23,6 +23,7 @@ def rename(src, dst):
 def train():
     for j in range(3):
         modelos = [f"C{k}=simulacion_simulador/mejor_genoma_c{k}_{j}.pkl" for k in range(1, 5)]
+        modelos.append(f"C4=simulacion_simulador/mejor_genoma_c4_{j}.pkl")
         train_cmd = [
             sys.executable, "p2_entrenar.py",
             "--evaluar", "--episodios", "1",
